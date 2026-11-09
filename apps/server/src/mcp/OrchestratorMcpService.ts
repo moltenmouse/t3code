@@ -64,6 +64,7 @@ import {
   isOrchestrationV2WorkActive,
   resolveProjectProviderInstanceEnabled,
 } from "@t3tools/contracts";
+import { aivaDelegationWorkspace } from "../aiva/delegation.ts";
 import { getProviderOptionCurrentValue } from "@t3tools/shared/model";
 import { runRanAfter } from "@t3tools/shared/orchestrationV2ThreadError";
 import { formatThreadLink } from "@t3tools/shared/threadLinks";
@@ -2427,7 +2428,11 @@ const make = Effect.gen(function* () {
               ),
             );
         }
-        workspaceStrategy = { type: "worktree", baseRef: base.commitSha, startFromOrigin: false };
+        workspaceStrategy = aivaDelegationWorkspace(
+          input.clientRequestId,
+          parent.thread.worktreePath ?? project.workspaceRoot,
+          { type: "worktree", baseRef: base.commitSha, startFromOrigin: false },
+        );
       }
       // ThreadManagementService.dispatch is the chokepoint for this command
       // type's own enablement check, using the same command id and its

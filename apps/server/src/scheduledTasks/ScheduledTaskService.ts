@@ -26,6 +26,7 @@ import {
   managedPolicyDeniedMessage,
   managedRuntimeModeDenial,
 } from "@t3tools/contracts";
+import { aivaWebhookBaseUrl } from "../aiva/settings.ts";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as SecureRandom from "effect/crypto/SecureRandom";
@@ -347,7 +348,7 @@ function webhookEndpoint(
   origin: WebhookOrigin | null,
 ): ScheduledTask["webhook"] {
   if (row.webhook_token === null) return undefined;
-  const base = origin?.relayHookBaseUrl ?? null;
+  const base = origin?.relayHookBaseUrl ?? aivaWebhookBaseUrl();
   return {
     path: webhookPath(row.task_id, row.webhook_token),
     url: base === null ? null : `${base}/${encodeURIComponent(row.task_id)}/${row.webhook_token}`,

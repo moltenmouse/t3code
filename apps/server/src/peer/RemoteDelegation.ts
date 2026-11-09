@@ -14,6 +14,7 @@ import {
   type RunId,
   type ThreadId,
 } from "@t3tools/contracts";
+import { aivaRemoteWorkspace } from "../aiva/delegation.ts";
 import * as Context from "effect/Context";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Duration from "effect/Duration";
@@ -212,7 +213,8 @@ const make = Effect.gen(function* () {
       const { target } = input;
       // A worktree there would branch from a commit this checkout has and the
       // other may not, so a remote task runs in that project's checkout.
-      if (input.isolation === "worktree") {
+      const remoteWorkspace = aivaRemoteWorkspace(input.isolation, input.clientRequestId);
+      if (input.isolation === "worktree" && remoteWorkspace === undefined) {
         return yield* new OrchestratorMcpFailure({
           code: "invalid_request",
           message:
@@ -269,6 +271,7 @@ const make = Effect.gen(function* () {
           ...(runtimeMode === undefined ? {} : { runtimeMode }),
           ...(interactionMode === undefined ? {} : { interactionMode }),
           message: task,
+          ...(remoteWorkspace === undefined ? {} : { workspaceStrategy: remoteWorkspace }),
           clientRequestId: `delegate:${scope.thread.threadId}:${key}`,
           // The thread there shows it is this thread's subagent, with a way back.
           delegatedFrom: {
