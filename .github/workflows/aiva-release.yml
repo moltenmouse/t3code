@@ -139,6 +139,10 @@ jobs:
         run: command -v patchelf || { sudo apt-get update && sudo apt-get install -y patchelf; }
       - name: Apply web client branding
         run: node scripts/apply-web-brand-assets.ts production apps/server/dist/client
+      - name: Build CLI single-executable
+        env:
+          T3CODE_TELEMETRY_CHANNEL: dev
+        run: node apps/server/scripts/cli.ts build-exe --verbose
       - name: Build CLI archive
         run: |
           node scripts/build-cli-archive.ts \
