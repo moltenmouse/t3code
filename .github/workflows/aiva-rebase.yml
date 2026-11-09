@@ -1,0 +1,119 @@
+# Daily: rebase the Aiva patch queue onto upstream's newest stable tag, build
+# and smoke-test it, and report. With `promote`, move `aiva` there and release.
+name: aiva-rebase
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+    inputs:
+      promote:
+        description: "Move aiva to the rebased branch and release it"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+  actions: write
+
+concurrency:
+  group: aiva-rebase
+  cancel-in-progress: false
+
+jobs:
+  rebase:
+    runs-on: ubuntu-24.04
+    outputs:
+      new_tag: ${{ steps.check.outputs.new_tag }}
+      branch: ${{ steps.rebase.outputs.branch }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: aiva
+          fetch-depth: 0
+      - name: Find upstream's newest stable tag
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/pingdotgg/t3code.git
+          base="$(tr -d '[:space:]' < AIVA_BASE)"
+          newest="$(git ls-remote --tags upstream 'refs/tags/v*' | sed 's#.*refs/tags/##' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)"
+          echo "base=$base newest=$newest"
+          if [[ "$newest" == "$base" ]] || [[ "$(printf '%s\n%s\n' "$base" "$newest" | sort -V | tail -1)" == "$base" ]]; then
+            echo "new_tag=" >> "$GITHUB_OUTPUT"
+          else
+            echo "new_tag=$newest" >> "$GITHUB_OUTPUT"
+            echo "base=$base" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Rebase the patch queue
+        id: rebase
+        if: steps.check.outputs.new_tag != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          new="${{ steps.check.outputs.new_tag }}"; base="${{ steps.check.outputs.base }}"
+          git fetch --no-tags upstream "refs/tags/$base:refs/tags/$base" "refs/tags/$new:refs/tags/$new"
+          git config user.name "aiva-rebase"; git config user.email "aiva-rebase@users.noreply.github.com"
+          branch="aiva-on-$new"
+          git switch -c "$branch"
+          if ! git rebase --onto "$new" "$base" "$branch"; then
+            conflicts="$(git diff --name-only --diff-filter=U | sed 's/^/- /')"
+            git rebase --abort
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "Rebase onto $new conflicts" \
+              --body "$(printf 'The Aiva patch queue does not apply cleanly onto %s.\n\nConflicting files:\n%s\n\nRebase by hand: `git rebase --onto %s %s aiva`.' "$new" "$conflicts" "$new" "$base")"
+            exit 1
+          fi
+          echo "$new" > AIVA_BASE
+          git commit -q -am "aiva: base $new" || true
+          git push -f origin "$branch"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+  verify:
+    needs: rebase
+    if: needs.rebase.outputs.branch != ''
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.rebase.outputs.branch }}
+      - name: Setup dependencies
+        uses: ./.github/actions/setup-ci-deps
+        with:
+          install-args: --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
+      - name: Typecheck the server
+        run: vp run --filter t3 typecheck
+      - name: Test our patches
+        shell: bash
+        run: |
+          if [ -d apps/server/src/aiva ]; then vp test apps/server/src/aiva; else echo "no patches yet"; fi
+      - name: Report
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title "Rebased onto ${{ needs.rebase.outputs.new_tag }}: ${{ job.status }}" \
+            --body "Branch \`${{ needs.rebase.outputs.branch }}\` is the Aiva patch queue on ${{ needs.rebase.outputs.new_tag }}. Checks: ${{ job.status }}. Promote it by running aiva-rebase with promote=true."
+
+  promote:
+    needs: [rebase, verify]
+    if: inputs.promote && needs.verify.result == 'success'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.rebase.outputs.branch }}
+          fetch-depth: 0
+      - name: Move aiva and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git push -f origin "HEAD:refs/heads/aiva"
+          gh workflow run aiva-release.yml --repo "$GITHUB_REPOSITORY" -f revision=1 -f ref=aiva
