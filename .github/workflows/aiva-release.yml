@@ -1,0 +1,204 @@
+# Builds and publishes an Aiva release of t3: Linux CLI archives (x64, arm64),
+# SHA256SUMS and the update feed files, as a GitHub release v<version>.
+# Mirrors the Linux CLI path of upstream's release.yml / release-desktop.yml,
+# without desktop, mobile, npm or signing.
+name: aiva-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: "Aiva revision n, giving v<upstream>-aiva.<n>"
+        required: true
+        default: "1"
+      ref:
+        description: "Branch or commit to build (default: aiva)"
+        required: false
+        default: "aiva"
+  push:
+    tags:
+      - "v*-aiva.*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: aiva-release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Resolve version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      ref: ${{ steps.v.outputs.ref }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'push' && github.ref || inputs.ref }}
+      - id: v
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            ref="${GITHUB_REF}"
+          else
+            base="$(tr -d '[:space:]' < AIVA_BASE)"
+            version="${base#v}-aiva.${{ inputs.revision }}"
+            ref="${{ inputs.ref }}"
+          fi
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-aiva\.[0-9]+$ ]]; then
+            echo "Bad version: $version" >&2; exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "Building t3 $version from $ref"
+
+  bundle:
+    name: Build JS bundle
+    needs: version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.version.outputs.ref }}
+      - name: Setup dependencies
+        uses: ./.github/actions/setup-ci-deps
+        with:
+          install-args: --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
+      - name: Align package versions to release version
+        run: node scripts/update-release-package-versions.ts "${{ needs.version.outputs.version }}"
+      - name: Pick bundle script
+        id: bundle_build
+        run: |
+          script="$(node -p "require('./package.json').scripts['build:desktop:bundle'] ? 'build:desktop:bundle' : 'build:desktop'")"
+          echo "script=$script" >> "$GITHUB_OUTPUT"
+      - name: Install browser secret helper build libraries
+        if: steps.bundle_build.outputs.script == 'build:desktop'
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
+      - name: Build JS bundle
+        env:
+          T3CODE_TELEMETRY_CHANNEL: dev
+        run: vp run ${{ steps.bundle_build.outputs.script }}
+      - name: Upload JS bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: js-bundle
+          path: |
+            apps/server/dist
+            apps/desktop/dist-electron
+          if-no-files-found: error
+          retention-days: 1
+
+  cli:
+    name: CLI archive (linux-${{ matrix.arch }})
+    needs: [version, bundle]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-24.04
+            rust_target: x86_64-unknown-linux-gnu
+            resource_key: linux-x64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+            resource_key: linux-arm64
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.version.outputs.ref }}
+      - name: Setup dependencies
+        uses: ./.github/actions/setup-ci-deps
+        with:
+          install-args: --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts...
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+      - name: Align package versions to release version
+        run: node scripts/update-release-package-versions.ts "${{ needs.version.outputs.version }}"
+      - name: Download JS bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: js-bundle
+          path: apps
+      - name: Build resource monitor
+        run: cargo build --locked --release --manifest-path native/resource-monitor/Cargo.toml --target "${{ matrix.rust_target }}"
+      - name: Stage resource monitor
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/cli-resource-monitor/${{ matrix.resource_key }}"
+          mkdir -p "$dir"
+          cp "native/resource-monitor/target/${{ matrix.rust_target }}/release/t3-resource-monitor" "$dir/t3-resource-monitor"
+      - name: Install patchelf
+        run: command -v patchelf || { sudo apt-get update && sudo apt-get install -y patchelf; }
+      - name: Apply web client branding
+        run: node scripts/apply-web-brand-assets.ts production apps/server/dist/client
+      - name: Build CLI archive
+        run: |
+          node scripts/build-cli-archive.ts \
+            --platform linux \
+            --arch "${{ matrix.arch }}" \
+            --version "${{ needs.version.outputs.version }}" \
+            --resource-monitor-dir "$RUNNER_TEMP/cli-resource-monitor" \
+            --output-dir release-cli
+      - name: Smoke-test CLI archive
+        run: node scripts/smoke-cli-archive.ts --archive release-cli/* --expect-version "${{ needs.version.outputs.version }}"
+      - name: Upload CLI archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: cli-linux-${{ matrix.arch }}
+          path: release-cli/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub release
+    needs: [version, cli]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download CLI archives
+        uses: actions/download-artifact@v8
+        with:
+          pattern: cli-linux-*
+          path: dist
+          merge-multiple: true
+      - name: Checksums and update feed files
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          version="${{ needs.version.outputs.version }}"
+          ls -la
+          sha256sum t3-*.tar.gz > SHA256SUMS
+          date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          for pair in "x64:latest-linux.yml" "arm64:latest-linux-arm64.yml"; do
+            arch="${pair%%:*}"; feed="${pair#*:}"
+            archive="t3-${version}-linux-${arch}.tar.gz"
+            [ -f "$archive" ] || { echo "missing $archive" >&2; exit 1; }
+            printf 'version: %s\npath: %s\nsha256: %s\nreleaseDate: %s\n' \
+              "$version" "$archive" "$(sha256sum "$archive" | cut -d' ' -f1)" "$date" > "$feed"
+          done
+          cat SHA256SUMS latest-linux.yml
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.version.outputs.version }}"
+          tag="v${version}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $tag already exists" >&2; exit 1
+          fi
+          gh release create "$tag" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "${{ needs.version.outputs.ref == 'aiva' && 'aiva' || github.sha }}" \
+            --title "t3 ${version} (Aiva)" \
+            --notes "Upstream $(echo "$version" | sed 's/-aiva\..*//') plus the patches in AIVA_PATCHES.md." \
+            --latest
