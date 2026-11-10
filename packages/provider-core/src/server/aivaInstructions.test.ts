@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { aivaDisabledTools, aivaOrchestrationSections } from "./aivaInstructions.ts";
+import {
+  AIVA_SENTENCE_REWRITES,
+  AIVA_SENTENCES_KEPT,
+  aivaDisabledTools,
+  aivaOrchestrationSections,
+} from "./aivaInstructions.ts";
 import { T3_CODE_ORCHESTRATION_SECTIONS } from "./orchestrationInstructions.ts";
 
 const HIDDEN = [
@@ -30,10 +35,57 @@ describe("aivaOrchestrationSections", () => {
     expect(text).toContain("call `request_secret`");
     expect(text).toContain("### Visuals and preview");
     expect(text).toContain("`html_preview`");
-    expect(text).toContain("If you are a subagent or child, do the work yourself.");
-    // Every kept line comes from upstream.
-    const upstream = T3_CODE_ORCHESTRATION_SECTIONS.join("\n");
-    for (const line of text.split("\n")) expect(upstream).toContain(line);
+    expect(text).toContain("As a subagent or child, do the work yourself.");
+    // Every kept sentence comes from upstream, word for word.
+    const flat = (t: string) => t.replace(/\s+/g, " ");
+    const upstream = flat(T3_CODE_ORCHESTRATION_SECTIONS.join("\n"));
+    const rewritten = new Set(Object.values(AIVA_SENTENCE_REWRITES));
+    for (const line of text.split("\n")) {
+      for (const sentence of flat(line.replace(/^- /, "")).split(/(?<=[.!?])\s+(?=[A-Z`"(])/)) {
+        if (!rewritten.has(sentence)) expect(upstream).toContain(sentence);
+      }
+    }
+  });
+
+  it("drops only the sentences about a hidden tool, keeping the rest of the bullet", () => {
+    const text = aivaOrchestrationSections(T3_CODE_ORCHESTRATION_SECTIONS, [
+      ...HIDDEN,
+      "request_secret",
+    ]).join("\n\n");
+    expect(text).not.toContain("request_secret");
+    // What followed it about the secret goes too (its sudo recipe needs the secret file)…
+    expect(text).not.toContain("Not for access you have.");
+    expect(text).not.toContain("sudo -S");
+    // …but the bullet's advice about another tool stays.
+    expect(text).toContain("- Asked only to schedule: `schedule_task` without running its prompt.");
+  });
+
+  it("keeps the guidance that still applies around hidden tools", () => {
+    const text = aivaOrchestrationSections(T3_CODE_ORCHESTRATION_SECTIONS, [
+      ...HIDDEN,
+      "create_threads",
+    ]).join("\n\n");
+    expect(text).toContain("Workflow only when asked.");
+    expect(text).toContain(
+      "`t3_thread_launch` makes new top-level threads, only when the user asks for a new thread.",
+    );
+    expect(text).toContain("Worktree thread: set `workspaceStrategy`");
+    expect(text).not.toContain("create_threads");
+  });
+
+  it("still finds every sentence it rewrites or keeps in t3's text", () => {
+    const upstream = T3_CODE_ORCHESTRATION_SECTIONS.join("\n").replace(/\s+/g, " ");
+    for (const sentence of [...Object.keys(AIVA_SENTENCE_REWRITES), ...AIVA_SENTENCES_KEPT])
+      expect(upstream).toContain(sentence);
+  });
+
+  it("keeps a bullet's sentences after the hidden part once another tool comes up", () => {
+    const sections = [
+      "- First use `delegate_task`. It reports back. Then `html_preview` the result. Done.",
+    ];
+    expect(aivaOrchestrationSections(sections, HIDDEN)).toEqual([
+      "- Then `html_preview` the result. Done.",
+    ]);
   });
 
   it("drops a section whose bullets were all about hidden tools", () => {
