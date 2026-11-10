@@ -195,6 +195,12 @@ export const OrchestratorMcpDelegateTaskInput = Schema.Struct({
     }),
   ),
   interactionMode: Schema.optional(OrchestratorMcpInteractionMode),
+  forkContext: Schema.optional(
+    Schema.Boolean.annotate({
+      description:
+        "Fork: the child continues this session's own agent conversation with its full context (not a summary), instead of starting blank. Same agent and account as this session. Combine with `isolation` to choose the child's checkout.",
+    }),
+  ),
 });
 export type OrchestratorMcpDelegateTaskInput = typeof OrchestratorMcpDelegateTaskInput.Type;
 
