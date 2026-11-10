@@ -13,6 +13,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import { OrchestratorRuntimeModeAboveCeilingError } from "../../../orchestration-v2/Orchestrator.ts";
 import * as ThreadLaunch from "../../../orchestration-v2/ThreadLaunchService.ts";
+import { takeAivaNativeImport } from "../../../aiva/imports.ts";
 import * as ThreadMessageIntake from "../../../orchestration-v2/ThreadMessageIntake.ts";
 import * as Claims from "../../../orchestration-v2/AttachmentClaims.ts";
 import * as Project from "../../../project/ProjectService.ts";
@@ -223,6 +224,14 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
             )?.supportedRuntimeModes,
           });
         }
+        // P7: continue an existing native conversation, when the sidecar named one.
+        const aivaImport = takeAivaNativeImport(input.clientRequestId);
+        const aivaImportDriver =
+          aivaImport === null
+            ? undefined
+            : (yield* (yield* ProviderRegistry.ProviderRegistry).getProviders).find(
+                (provider) => provider.instanceId === modelSelection.instanceId,
+              )?.driver;
         const result = yield* ThreadMessageIntake.launchThread({
           commandId,
           threadId,
@@ -247,6 +256,14 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
           ...(linkOrigin === undefined ? {} : { linkOrigin }),
           // Kept only alongside linkOrigin: thread.create drops it otherwise.
           ...(input.delegatedFrom === undefined ? {} : { delegatedFrom: input.delegatedFrom }),
+          ...(aivaImport === null || aivaImportDriver === undefined
+            ? {}
+            : {
+                importedNativeThread: {
+                  ref: { driver: aivaImportDriver, nativeId: aivaImport.nativeId, strength: "strong" as const },
+                  metadata: { title: aivaImport.title ?? input.title },
+                },
+              }),
         }).pipe(
           Effect.mapError((error) => {
             if (error._tag === "AttachmentClaimError") {
