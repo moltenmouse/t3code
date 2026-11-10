@@ -7909,6 +7909,62 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         payload: taskTurnItem,
       });
 
+      // Aiva P8: a forked child continues the parent's native agent session.
+      // Give the child a provider thread that is a strong native reference to
+      // the parent's current native session, emitted before its first message
+      // dispatches, so the first turn resumes that conversation with the
+      // parent's full context instead of starting the agent blank. If the
+      // parent exposes no strong native session, fall through to an ordinary
+      // fresh subagent (the caller keeps a task summary as a fallback).
+      if (command.forkContext === true) {
+        const parentNative = parentProjection.providerThreads.find(
+          (candidate) =>
+            candidate.id === parentProjection.thread.activeProviderThreadId &&
+            candidate.nativeThreadRef !== null &&
+            candidate.nativeThreadRef.strength === "strong" &&
+            candidate.nativeThreadRef.nativeId !== null,
+        );
+        const parentNativeId = parentNative?.nativeThreadRef?.nativeId ?? null;
+        if (parentNativeId !== null) {
+          const driver = targetAdapter.driver;
+          const nativeThreadRef = {
+            driver,
+            nativeId: parentNativeId,
+            strength: "strong" as const,
+          };
+          yield* emitEvent({
+            type: "provider-thread.updated",
+            threadId: childThreadId,
+            driver,
+            providerInstanceId: command.modelSelection.instanceId,
+            occurredAt: now,
+            payload: {
+              id: idAllocator.derive.providerThread({
+                driver,
+                providerInstanceId: command.modelSelection.instanceId,
+                nativeThreadId: nativeThreadRef.nativeId,
+              }),
+              driver,
+              providerInstanceId: command.modelSelection.instanceId,
+              providerSessionId: null,
+              appThreadId: childThreadId,
+              ownerNodeId: null,
+              nativeThreadRef,
+              nativeConversationHeadRef: null,
+              status: "not_loaded",
+              firstRunOrdinal: null,
+              lastRunOrdinal: null,
+              handoffIds: [],
+              forkedFrom: null,
+              contextUsage: null,
+              nativeMetadata: null,
+              createdAt: now,
+              updatedAt: now,
+            },
+          });
+        }
+      }
+
       const childMessageCommand = {
         type: "message.dispatch",
         createdBy: command.createdBy,

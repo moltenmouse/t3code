@@ -2434,6 +2434,18 @@ const make = Effect.gen(function* () {
           { type: "worktree", baseRef: base.commitSha, startFromOrigin: false },
         );
       }
+      // Aiva P8: continuing the parent's native conversation means the child
+      // resumes the parent's own agent session, so it must run on the same
+      // provider instance. A different agent/model cannot read that session.
+      if (
+        input.forkContext === true &&
+        target.modelSelection.instanceId !== parentRun.providerInstanceId
+      ) {
+        return yield* failure(
+          "invalid_request",
+          "forkContext continues this session's own agent conversation, so the child runs on the same provider. Omit target (or match this session's provider).",
+        );
+      }
       // ThreadManagementService.dispatch is the chokepoint for this command
       // type's own enablement check, using the same command id and its
       // receipt-replay exemption, so no separate assert runs here.
@@ -2452,6 +2464,7 @@ const make = Effect.gen(function* () {
           runtimeMode,
           interactionMode,
           ...(workspaceStrategy === undefined ? {} : { workspaceStrategy }),
+          ...(input.forkContext === true ? { forkContext: true } : {}),
           // Async delegations wake the parent on every child terminal; wait
           // delegations deliver through the blocking tool call, so a wake is
           // only needed if the parent settled first (timeout, disconnect).

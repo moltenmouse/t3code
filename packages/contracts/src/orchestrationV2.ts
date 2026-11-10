@@ -3331,6 +3331,10 @@ export const OrchestrationV2Command = Schema.Union([
     workspaceStrategy: Schema.optional(OrchestrationV2ThreadLaunchWorkspaceStrategy),
     // Defaults to settled_only; fire-and-forget wakes require always.
     completionWake: Schema.optional(Schema.Literals(["always", "settled_only"])),
+    // Aiva P8: the child continues the parent's native agent conversation
+    // (its provider thread is a strong native fork of the parent's), so it
+    // starts with the parent's full context instead of only the task prompt.
+    forkContext: Schema.optional(Schema.Boolean),
     createdAt: Schema.optional(Schema.DateTimeUtc),
   }),
   Schema.Struct({
