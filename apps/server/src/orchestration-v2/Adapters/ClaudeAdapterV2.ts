@@ -1,5 +1,6 @@
 import * as DocumentText from "../../provider/DocumentText.ts";
 import { aivaClaudeQueryOptions } from "../../aiva/threadConfig.ts";
+import { aivaFullAccessApproves } from "../../aiva/approvals.ts";
 import {
   compactDynamicToolOutput,
   mcpToolResultOutput,
@@ -11752,6 +11753,18 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             return {
               behavior: "deny",
               message: `Claude Code's removal safety check denied this command; the user did not reject it. The command did not run. Do not bypass the check by splitting the removal, putting it in a script, or using another tool or shell. If the warning below supplies a safe rewrite, use it and let the same check evaluate it. Otherwise continue the rest of the task without the removal and tell the user what you needed to delete and why. Warning: ${safetyReason}`,
+              toolUseID: callbackOptions.toolUseID,
+            } satisfies PermissionResult;
+          }
+
+          if (aivaFullAccessApproves(context.input.runtimePolicy, activePermissionMode)) {
+            yield* Effect.logInfo("aiva: full access approved a permission request", {
+              toolName,
+              reason: safetyReason,
+            });
+            return {
+              behavior: "allow",
+              updatedInput: toolInput,
               toolUseID: callbackOptions.toolUseID,
             } satisfies PermissionResult;
           }
