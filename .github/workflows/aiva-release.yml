@@ -1,9 +1,12 @@
 # Builds and publishes an Aiva release of t3: CLI archives for Linux (x64,
-# arm64) and macOS (Apple silicon), SHA256SUMS and the update feed files, as a
-# GitHub release v<version>. Mirrors the CLI path of upstream's release.yml /
-# release-desktop.yml, without desktop, mobile, npm or a signing certificate:
-# the macOS build is signed ad hoc, as upstream's is without one. No Intel
-# macOS build: Node can't make t3's single executable there (see release.yml).
+# arm64), macOS (Apple silicon) and Windows (x64), SHA256SUMS and the update
+# feed files, as a GitHub release v<version>. Mirrors the CLI path of upstream's
+# release.yml / release-desktop.yml, without desktop, mobile, npm or a signing
+# certificate: the macOS build is signed ad hoc, as upstream's is without one,
+# and the Windows one isn't signed. No Intel macOS build: Node can't make t3's
+# single executable there (see release.yml). Windows is built on Linux, as
+# upstream does (cargo-xwin, and the target's Node for the executable), and
+# its archive is smoke-tested on a Windows runner.
 name: aiva-release
 
 on:
@@ -117,6 +120,11 @@ jobs:
             runner: macos-15
             rust_target: aarch64-apple-darwin
             resource_key: darwin-arm64
+          - platform: win
+            arch: x64
+            runner: ubuntu-24.04
+            rust_target: x86_64-pc-windows-msvc
+            resource_key: win32-x64
     steps:
       - uses: actions/checkout@v6
         with:
@@ -136,14 +144,38 @@ jobs:
         with:
           name: js-bundle
           path: apps
+      - name: Install cargo-xwin
+        if: matrix.platform == 'win'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-xwin@0.23.1
       - name: Build resource monitor
-        run: cargo build --locked --release --manifest-path native/resource-monitor/Cargo.toml --target "${{ matrix.rust_target }}"
+        run: cargo ${{ matrix.platform == 'win' && 'xwin build' || 'build' }} --locked --release --manifest-path native/resource-monitor/Cargo.toml --target "${{ matrix.rust_target }}"
       - name: Stage resource monitor
         run: |
           set -euo pipefail
+          exe="t3-resource-monitor${{ matrix.platform == 'win' && '.exe' || '' }}"
           dir="$RUNNER_TEMP/cli-resource-monitor/${{ matrix.resource_key }}"
           mkdir -p "$dir"
-          cp "native/resource-monitor/target/${{ matrix.rust_target }}/release/t3-resource-monitor" "$dir/t3-resource-monitor"
+          cp "native/resource-monitor/target/${{ matrix.rust_target }}/release/$exe" "$dir/$exe"
+      # The executable embeds the target's Node: put a checksum-verified copy
+      # where tsdown looks, as upstream's release-desktop.yml does.
+      - name: Download Windows Node.js for the CLI executable
+        if: matrix.platform == 'win'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p 'require("./package.json").engines.node')"
+          name="node-v$version-win-x64"
+          dir="$RUNNER_TEMP/node-download"
+          mkdir -p "$dir"
+          fetch=(curl -fsSL --retry 5 --retry-all-errors --connect-timeout 10 --speed-limit 102400 --speed-time 30)
+          "${fetch[@]}" -o "$dir/$name.zip" "https://nodejs.org/dist/v$version/$name.zip"
+          "${fetch[@]}" -o "$dir/SHASUMS256.txt" "https://nodejs.org/dist/v$version/SHASUMS256.txt"
+          (cd "$dir" && grep " $name.zip\$" SHASUMS256.txt | sha256sum -c -)
+          dest="${XDG_CACHE_HOME:-$HOME/.cache}/tsdown/node/v$version/win-x64"
+          mkdir -p "$dest"
+          unzip -p "$dir/$name.zip" "$name/node.exe" > "$dest/node.exe"
       - name: Install patchelf
         if: matrix.platform == 'linux'
         run: command -v patchelf || { sudo apt-get update && sudo apt-get install -y patchelf; }
@@ -152,7 +184,7 @@ jobs:
       - name: Build CLI single-executable
         env:
           T3CODE_TELEMETRY_CHANNEL: dev
-        run: node apps/server/scripts/cli.ts build-exe --verbose
+        run: node apps/server/scripts/cli.ts build-exe --verbose ${{ matrix.platform == 'win' && '--target win-x64' || '' }}
       - name: Build CLI archive
         run: |
           node scripts/build-cli-archive.ts \
@@ -161,7 +193,9 @@ jobs:
             --version "${{ needs.version.outputs.version }}" \
             --resource-monitor-dir "$RUNNER_TEMP/cli-resource-monitor" \
             --output-dir release-cli
+      # The Windows archive can't run here; cli-smoke-windows runs it.
       - name: Smoke-test CLI archive
+        if: matrix.platform != 'win'
         run: node scripts/smoke-cli-archive.ts --archive release-cli/* --expect-version "${{ needs.version.outputs.version }}"
       - name: Upload CLI archive
         uses: actions/upload-artifact@v7
@@ -171,9 +205,31 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  cli-smoke-windows:
+    name: Smoke-test the Windows CLI archive
+    needs: [version, cli]
+    runs-on: windows-2025
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: cli-win32-x64
+          path: dist
+      - name: Unpack it and run t3.exe
+        shell: pwsh
+        run: |
+          $version = "${{ needs.version.outputs.version }}"
+          $stem = "t3-$version-win32-x64"
+          Expand-Archive "dist/$stem.zip" -DestinationPath smoke
+          foreach ($file in @("t3.exe", "resource-monitor/win32-x64/t3-resource-monitor.exe", "client/index.html")) {
+            if (-not (Test-Path "smoke/$stem/$file")) { throw "$stem.zip has no $file" }
+          }
+          $said = & "smoke/$stem/t3.exe" --version
+          if ($LASTEXITCODE -ne 0 -or "$said" -notmatch [regex]::Escape($version)) { throw "t3.exe --version said: $said" }
+          "t3.exe --version: $said"
+
   release:
     name: Publish GitHub release
-    needs: [version, cli]
+    needs: [version, cli, cli-smoke-windows]
     runs-on: ubuntu-24.04
     steps:
       - name: Download CLI archives
@@ -189,11 +245,13 @@ jobs:
           cd dist
           version="${{ needs.version.outputs.version }}"
           ls -la
-          sha256sum t3-*.tar.gz > SHA256SUMS
+          sha256sum t3-*.tar.gz t3-*.zip > SHA256SUMS
           date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          for pair in "linux-x64:latest-linux.yml" "linux-arm64:latest-linux-arm64.yml" "darwin-arm64:latest-mac.yml"; do
+          # t3's feed file for Windows is latest.yml.
+          for pair in "linux-x64:latest-linux.yml" "linux-arm64:latest-linux-arm64.yml" "darwin-arm64:latest-mac.yml" "win32-x64:latest.yml"; do
             key="${pair%%:*}"; feed="${pair#*:}"
-            archive="t3-${version}-${key}.tar.gz"
+            ext="tar.gz"; [[ "$key" == win32-* ]] && ext="zip"
+            archive="t3-${version}-${key}.${ext}"
             [ -f "$archive" ] || { echo "missing $archive" >&2; exit 1; }
             printf 'version: %s\npath: %s\nsha256: %s\nreleaseDate: %s\n' \
               "$version" "$archive" "$(sha256sum "$archive" | cut -d' ' -f1)" "$date" > "$feed"
