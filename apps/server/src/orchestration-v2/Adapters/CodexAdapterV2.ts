@@ -103,7 +103,12 @@ import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { resolveAttachmentPath, resolveAttachmentPathById } from "../../attachmentStore.ts";
 import * as PortScanner from "../../preview/PortScanner.ts";
 import { aivaCodexThreadParams } from "../../aiva/threadConfig.ts";
-import { aivaVoice, aivaVoiceAttach, type AivaVoiceClaim } from "../../aiva/voice.ts";
+import {
+  aivaThreadSettingsUpdate,
+  aivaVoice,
+  aivaVoiceAttach,
+  type AivaVoiceClaim,
+} from "../../aiva/voice.ts";
 import { getCodexServiceTierOptionValue } from "../../codexModelOptions.ts";
 import { ServerConfig } from "../../config.ts";
 import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
@@ -2054,7 +2059,28 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           if (nativeThreadId == null) return;
           rootProviderThreads.set(nativeThreadId, providerThread);
           if (providerThread.appThreadId !== null) {
-            aivaVoice.bindThread(providerThread.appThreadId, nativeThreadId, client.raw.request);
+            aivaVoice.bindThread(
+              providerThread.appThreadId,
+              nativeThreadId,
+              client.raw.request,
+              (settings) =>
+                buildCodexTurnStartParams({
+                  nativeThreadId,
+                  codexInput: [],
+                  runtimePolicy:
+                    settings.runtimePolicy as ProviderAdapter.ProviderAdapterV2RuntimePolicy,
+                  modelSelection: settings.modelSelection as ModelSelection,
+                  omitServiceTier: adapterOptions.resolveRuntime !== undefined,
+                }).pipe(
+                  Effect.flatMap((params) =>
+                    client.raw.request(
+                      "thread/settings/update",
+                      aivaThreadSettingsUpdate(nativeThreadId, params),
+                    ),
+                  ),
+                  Effect.asVoid,
+                ),
+            );
           }
           yield* emitGoalUpdate(nativeThreadId);
         });

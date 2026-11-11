@@ -14,6 +14,9 @@ import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
+import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
+import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
+import * as RuntimePolicy from "../orchestration-v2/RuntimePolicy.ts";
 import { requestUrl } from "../requestUrl.ts";
 import { AivaVoiceError, aivaVoice, type AivaVoiceEvent, type AivaVoiceHub } from "./voice.ts";
 
@@ -171,8 +174,42 @@ const dispatcher = Layer.effectDiscard(
         })
         .pipe(Effect.asVoid),
     );
-    yield* Effect.addFinalizer(() => Effect.sync(() => aivaVoice.setDispatch(null)));
+    // A call takes the thread's settings as they are now, as its next turn would.
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const runtimePolicy = yield* RuntimePolicy.RuntimePolicyV2;
+    aivaVoice.setSettingsSource((threadId) =>
+      projections
+        .getThread(ThreadId.make(threadId))
+        .pipe(
+          Effect.flatMap((thread) =>
+            runtimePolicy
+              .resolve({ thread, modelSelection: thread.modelSelection })
+              .pipe(
+                Effect.map((policy) => ({
+                  runtimePolicy: policy,
+                  modelSelection: thread.modelSelection,
+                })),
+              ),
+          ),
+        ),
+    );
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        aivaVoice.setDispatch(null);
+        aivaVoice.setSettingsSource(null);
+      }),
+    );
   }),
 );
 
-export const layer = Layer.mergeAll(routes(aivaVoice), dispatcher);
+export const layer = Layer.mergeAll(
+  routes(aivaVoice),
+  dispatcher.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        ProjectionStore.layer,
+        RuntimePolicy.layerFromProjectStore.pipe(Layer.provide(ProjectStore.layer)),
+      ),
+    ),
+  ),
+);

@@ -38,7 +38,12 @@ import packageJson from "../../package.json" with { type: "json" };
 import * as CodexAdapterV2 from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import * as ProviderReplayHarness from "../orchestration-v2/testkit/ProviderReplayHarness.ts";
 import { aivaCodexThreadParams } from "./threadConfig.ts";
-import { AIVA_VOICE_MESSAGE_PREFIX, aivaVoice, type AivaVoiceEvent } from "./voice.ts";
+import {
+  AIVA_VOICE_MESSAGE_PREFIX,
+  aivaThreadSettingsUpdate,
+  aivaVoice,
+  type AivaVoiceEvent,
+} from "./voice.ts";
 
 const SCENARIO = "aiva-voice";
 const NATIVE_THREAD = "voice-native-thread";
@@ -98,7 +103,16 @@ const agentMessage = (turnId: string, id: string, text: string) => [
   }),
 ];
 
-const transcript = (): CodexReplay.CodexAppServerReplayTranscript => ({
+/** What the thread is set to when the call starts: stricter than the typed turn (review point 1). */
+const CALL_POLICY = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+  runtimeMode: "approval-required",
+  interactionMode: "default",
+  cwd: "/workspace",
+});
+
+const transcript = (
+  callSettings: Record<string, unknown>,
+): CodexReplay.CodexAppServerReplayTranscript => ({
   provider: "codex",
   protocol: "codex.app-server",
   version: "0.159.0",
@@ -172,15 +186,17 @@ const transcript = (): CodexReplay.CodexAppServerReplayTranscript => ({
     notify("turn/started", { threadId: NATIVE_THREAD, turn: turn("typed-turn", "inProgress") }),
     ...agentMessage("typed-turn", "typed-answer", "Hi."),
     notify("turn/completed", { threadId: NATIVE_THREAD, turn: turn("typed-turn", "completed") }),
-    // The call.
-    out(4, "thread/realtime/start", {
+    // The call: the thread's settings as they are now go on first, then the call.
+    out(4, "thread/settings/update", callSettings),
+    reply(4, {}),
+    out(5, "thread/realtime/start", {
       threadId: NATIVE_THREAD,
       outputModality: "audio",
       version: "v3",
       includeStartupContext: true,
       transport: { type: "webrtc", sdp: "offer" },
     }),
-    reply(4, {}),
+    reply(5, {}),
     notify("thread/realtime/sdp", { threadId: NATIVE_THREAD, sdp: "answer" }),
     notify("thread/realtime/started", {
       threadId: NATIVE_THREAD,
@@ -253,6 +269,7 @@ describe("voice turns in the Codex adapter (P11)", () => {
     if (previous === undefined) delete process.env.T3CODE_AIVA_SETTINGS;
     else process.env.T3CODE_AIVA_SETTINGS = previous;
     aivaVoice.setDispatch(null);
+    aivaVoice.setSettingsSource(null);
   });
 
   it.effect("shows the turn Codex starts for a voice request as a run with what was said", () => {
@@ -260,7 +277,20 @@ describe("voice turns in the Codex adapter (P11)", () => {
     NodeFS.writeFileSync(NodePath.join(dir, "aiva.json"), "{}");
     process.env.T3CODE_AIVA_SETTINGS = NodePath.join(dir, "aiva.json");
     return Effect.gen(function* () {
-      const driver = yield* CodexReplay.makeReplayDriver(transcript());
+      const callSettings = aivaThreadSettingsUpdate(
+        NATIVE_THREAD,
+        yield* CodexAdapterV2.buildCodexTurnStartParams({
+          nativeThreadId: NATIVE_THREAD,
+          codexInput: [],
+          runtimePolicy: CALL_POLICY,
+          modelSelection: MODEL,
+        }),
+      );
+      assert.notDeepEqual(callSettings.sandboxPolicy, { type: "dangerFullAccess" });
+      aivaVoice.setSettingsSource(() =>
+        Effect.succeed({ runtimePolicy: CALL_POLICY, modelSelection: MODEL }),
+      );
+      const driver = yield* CodexReplay.makeReplayDriver(transcript(callSettings));
       const adapter = yield* CodexAdapterV2.makeCodexAdapterV2({
         instanceId: CodexAdapterV2.CODEX_DEFAULT_INSTANCE_ID,
         settings: SETTINGS,

@@ -1,6 +1,7 @@
 import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import { TestClock } from "effect/testing";
 import { CodexAppServerRequestError } from "effect-codex-app-server/errors";
 
 import {
@@ -108,7 +109,7 @@ describe("aiva voice", () => {
 
   it.effect("fails a start Codex reports an error for, with only a safe category", () =>
     Effect.gen(function* () {
-      const { hub } = setup();
+      const { hub, requests } = setup();
       const starting = yield* Effect.forkChild(Effect.flip(startCall(hub)));
       yield* Effect.yieldNow;
       yield* hub.notification("thread/realtime/error", {
@@ -118,12 +119,137 @@ describe("aiva voice", () => {
       const error = yield* Fiber.join(starting);
       assert.strictEqual(error.code, "auth");
       assert.notInclude(error.message, "sk-secret");
-      // The failed start left nothing behind; a newer generation can start.
+      // Codex still holds that session: it's stopped, and the call waits, closing, for its
+      // `closed`, so that late event can't end the next call (review point 5).
+      assert.strictEqual(hub.status("thread-1").call?.status, "closing");
+      assert.deepStrictEqual(requests.at(-1), {
+        method: "thread/realtime/stop",
+        params: { threadId: "native-1" },
+      });
+      const refused = yield* Effect.flip(startCall(hub, 2));
+      assert.strictEqual(refused.code, "busy");
+      yield* hub.notification("thread/realtime/closed", {
+        threadId: "native-1",
+        reason: "requested",
+      });
       assert.strictEqual(hub.status("thread-1").call, null);
       const again = yield* Effect.forkChild(startCall(hub, 2));
       yield* Effect.yieldNow;
       yield* hub.notification("thread/realtime/sdp", { threadId: "native-1", sdp: "answer" });
       assert.strictEqual((yield* Fiber.join(again)).sdpAnswer, "answer");
+      yield* hub.notification("thread/realtime/started", { threadId: "native-1", version: "v3" });
+      assert.strictEqual(hub.status("thread-1").call?.status, "started");
+    }),
+  );
+
+  it.effect("lets a closing call go when Codex never says closed", () =>
+    Effect.gen(function* () {
+      const { hub } = setup();
+      const starting = yield* Effect.forkChild(Effect.flip(startCall(hub)));
+      yield* Effect.yieldNow;
+      yield* hub.notification("thread/realtime/error", { threadId: "native-1", message: "boom" });
+      yield* Fiber.join(starting);
+      assert.strictEqual(hub.status("thread-1").call?.status, "closing");
+      yield* TestClock.adjust("16 seconds");
+      assert.strictEqual(hub.status("thread-1").call, null);
+    }),
+  );
+
+  it.effect("cleans up a start the caller gives up on (review point 4)", () =>
+    Effect.gen(function* () {
+      const { hub, requests } = setup();
+      const starting = yield* Effect.forkChild(startCall(hub));
+      yield* Effect.yieldNow;
+      assert.strictEqual(hub.status("thread-1").call?.status, "starting");
+      yield* Fiber.interrupt(starting);
+      // The start had reached Codex, so its session is stopped and the call is closing, not busy.
+      assert.strictEqual(hub.status("thread-1").call?.status, "closing");
+      assert.deepStrictEqual(requests.at(-1), {
+        method: "thread/realtime/stop",
+        params: { threadId: "native-1" },
+      });
+      yield* hub.notification("thread/realtime/closed", {
+        threadId: "native-1",
+        reason: "requested",
+      });
+      assert.strictEqual(hub.status("thread-1").call, null);
+    }),
+  );
+
+  it.effect("cleans up a start given up on before it reached Codex", () =>
+    Effect.gen(function* () {
+      const hub = new AivaVoiceHub(() => true);
+      hub.bindThread("thread-1", "native-1", () => Effect.never);
+      const starting = yield* Effect.forkChild(startCall(hub));
+      yield* Effect.yieldNow;
+      yield* Fiber.interrupt(starting);
+      assert.strictEqual(hub.status("thread-1").call, null);
+    }),
+  );
+
+  it.effect("puts the thread's current settings on Codex before the call (review point 1)", () =>
+    Effect.gen(function* () {
+      const { hub, requests } = setup();
+      const applied: Array<unknown> = [];
+      hub.bindThread(
+        "thread-1",
+        "native-1",
+        (method, params) =>
+          Effect.sync(() => void requests.push({ method, params })).pipe(Effect.as({})),
+        (settings) => Effect.sync(() => void applied.push(settings)),
+      );
+      hub.setSettingsSource((threadId) =>
+        Effect.succeed({
+          runtimePolicy: { runtimeMode: "approval-required", threadId },
+          modelSelection: { model: "m" },
+        }),
+      );
+      const starting = yield* Effect.forkChild(startCall(hub));
+      yield* Effect.yieldNow;
+      assert.deepStrictEqual(applied, [
+        {
+          runtimePolicy: { runtimeMode: "approval-required", threadId: "thread-1" },
+          modelSelection: { model: "m" },
+        },
+      ]);
+      assert.strictEqual(requests.at(-1)?.method, "thread/realtime/start");
+      yield* hub.notification("thread/realtime/sdp", { threadId: "native-1", sdp: "answer" });
+      yield* Fiber.join(starting);
+    }),
+  );
+
+  it.effect("refuses a call whose settings can't be applied, and sends Codex nothing", () =>
+    Effect.gen(function* () {
+      const { hub, requests } = setup();
+      hub.bindThread(
+        "thread-1",
+        "native-1",
+        (method, params) =>
+          Effect.sync(() => void requests.push({ method, params })).pipe(Effect.as({})),
+        () => Effect.fail(new CodexAppServerRequestError({ code: -32600, errorMessage: "no" })),
+      );
+      hub.setSettingsSource(() => Effect.succeed({ runtimePolicy: {}, modelSelection: {} }));
+      const error = yield* Effect.flip(startCall(hub));
+      assert.strictEqual(error.code, "settings");
+      assert.deepStrictEqual(requests, []);
+      assert.strictEqual(hub.status("thread-1").call, null);
+    }),
+  );
+
+  it.effect("keeps a late voice run's adoption record, however late (review point 2)", () =>
+    Effect.gen(function* () {
+      const { hub, dispatched } = setup();
+      const starting = yield* Effect.forkChild(startCall(hub));
+      yield* Effect.yieldNow;
+      yield* hub.notification("thread/realtime/sdp", { threadId: "native-1", sdp: "answer" });
+      yield* Fiber.join(starting);
+      const handoff = yield* Effect.forkChild(hub.turnStarted("native-1", "turn-7"));
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust("11 seconds");
+      assert.isFalse(yield* Fiber.join(handoff));
+      // Its run shows up much later: it gets a note, never a second Codex turn.
+      yield* TestClock.adjust("2 hours");
+      assert.deepStrictEqual(hub.claimAdoption(dispatched[0]!.messageId), { type: "expired" });
     }),
   );
 

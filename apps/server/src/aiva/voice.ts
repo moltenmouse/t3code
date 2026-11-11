@@ -7,6 +7,7 @@ import * as Data from "effect/Data";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import type * as Scope from "effect/Scope";
 import type * as CodexClient from "effect-codex-app-server/client";
 import type * as CodexErrors from "effect-codex-app-server/errors";
@@ -74,10 +75,19 @@ const ADOPT_TIMEOUT = Duration.seconds(10);
 /** Realtime protocol v3 (frameless), as old Aiva used. */
 const REALTIME_VERSION = "v3";
 
+/** What the thread's next turn would run with (t3's runtime policy and model), for the call. */
+export interface AivaVoiceSettings {
+  readonly runtimePolicy: unknown;
+  readonly modelSelection: unknown;
+}
+/** The adapter's way to put `settings` on the thread before a call (`thread/settings/update`). */
+export type AivaVoiceApplySettings = (settings: AivaVoiceSettings) => Effect.Effect<void, Error>;
+
 interface Binding {
   readonly appThreadId: string;
   readonly nativeThreadId: string;
   readonly request: AivaVoiceRequest;
+  readonly applySettings: AivaVoiceApplySettings | undefined;
 }
 
 interface Call {
@@ -88,6 +98,11 @@ interface Call {
   /** What the user said since the last voice turn: the text of the next one. */
   heard: Array<string>;
 }
+
+/** A closing call waits this long for Codex's `closed` before it's let go anyway. */
+const CLOSE_GRACE = Duration.seconds(15);
+/** Expired adoptions kept for runs still on their way; the oldest go past this many. */
+const MAX_EXPIRED_ADOPTIONS = 256;
 
 interface Adoption {
   readonly nativeThreadId: string;
@@ -109,6 +124,8 @@ export class AivaVoiceHub {
   private readonly adoptions = new Map<string, Adoption>();
   private readonly listeners = new Set<(event: AivaVoiceEvent) => void>();
   private dispatch: AivaVoiceDispatch | null = null;
+  private settingsFor: ((threadId: string) => Effect.Effect<AivaVoiceSettings, Error>) | null =
+    null;
   readonly enabled: () => boolean;
 
   constructor(enabled: () => boolean = () => loadAivaSettings() !== null) {
@@ -120,14 +137,26 @@ export class AivaVoiceHub {
     this.dispatch = dispatch;
   }
 
+  /** The route layer hands over how to read a thread's current settings (runtime policy, model). */
+  setSettingsSource(
+    source: ((threadId: string) => Effect.Effect<AivaVoiceSettings, Error>) | null,
+  ): void {
+    this.settingsFor = source;
+  }
+
   /** The adapter reports each thread it starts or resumes, with its app-server. */
-  bindThread(appThreadId: string, nativeThreadId: string, request: AivaVoiceRequest): void {
+  bindThread(
+    appThreadId: string,
+    nativeThreadId: string,
+    request: AivaVoiceRequest,
+    applySettings?: AivaVoiceApplySettings,
+  ): void {
     if (!this.enabled()) return;
     const previous = this.byThread.get(appThreadId);
     if (previous !== undefined && previous.nativeThreadId !== nativeThreadId) {
       this.byNative.delete(previous.nativeThreadId);
     }
-    const binding = { appThreadId, nativeThreadId, request };
+    const binding = { appThreadId, nativeThreadId, request, applySettings };
     this.byThread.set(appThreadId, binding);
     this.byNative.set(nativeThreadId, binding);
   }
@@ -209,8 +238,11 @@ export class AivaVoiceHub {
       }
       const binding = hub.byThread.get(input.threadId);
       if (binding === undefined) return yield* notReady();
-      if (hub.calls.has(input.threadId)) {
-        return yield* voiceError(409, "busy", "A voice call is already running in this session.");
+      const running = hub.calls.get(input.threadId);
+      if (running !== undefined) {
+        return yield* running.status === "closing"
+          ? voiceError(409, "busy", "The last call is still closing. Try again in a moment.")
+          : voiceError(409, "busy", "A voice call is already running in this session.");
       }
       if (
         !Number.isInteger(input.generation) ||
@@ -228,45 +260,83 @@ export class AivaVoiceHub {
       };
       hub.calls.set(input.threadId, call);
       hub.generations.set(input.threadId, input.generation);
-      const clear = Effect.sync(() => {
-        if (hub.calls.get(input.threadId) === call) hub.calls.delete(input.threadId);
-      });
+      let sent = false;
       const voice = input.voice?.trim();
-      return yield* binding
-        .request("thread/realtime/start", {
-          threadId: binding.nativeThreadId,
-          outputModality: "audio",
-          version: REALTIME_VERSION,
-          includeStartupContext: true,
-          transport: { type: "webrtc", sdp: input.sdpOffer },
-          ...(voice ? { voice } : {}),
-        })
-        .pipe(
-          Effect.mapError((cause) =>
-            voiceError(502, failureCategory(errorText(cause)), "Codex refused to start voice."),
-          ),
-          Effect.andThen(Deferred.await(answer)),
-          Effect.timeoutOrElse({
-            duration: START_TIMEOUT,
-            orElse: () =>
-              binding
-                .request("thread/realtime/stop", { threadId: binding.nativeThreadId })
-                .pipe(
-                  Effect.ignore,
-                  Effect.andThen(
-                    Effect.fail(
-                      voiceError(504, "timeout", "Codex didn't answer the call in time."),
-                    ),
-                  ),
+      // The spoken turns run with the thread's settings as they are now (access, sandbox, model),
+      // not whatever its last turn left in Codex: a turn Codex starts on its own takes those.
+      const applySettings =
+        hub.settingsFor === null || binding.applySettings === undefined
+          ? Effect.void
+          : hub.settingsFor(input.threadId).pipe(
+              Effect.flatMap((settings) => binding.applySettings!(settings)),
+              Effect.mapError(() =>
+                voiceError(
+                  502,
+                  "settings",
+                  "The session's settings couldn't be applied to the call.",
                 ),
-          }),
-          Effect.map((sdpAnswer) => {
+              ),
+            );
+      return yield* applySettings.pipe(
+        Effect.andThen(
+          binding
+            .request("thread/realtime/start", {
+              threadId: binding.nativeThreadId,
+              outputModality: "audio",
+              version: REALTIME_VERSION,
+              includeStartupContext: true,
+              transport: { type: "webrtc", sdp: input.sdpOffer },
+              ...(voice ? { voice } : {}),
+            })
+            .pipe(
+              Effect.mapError((cause) =>
+                voiceError(502, failureCategory(errorText(cause)), "Codex refused to start voice."),
+              ),
+            ),
+        ),
+        Effect.tap(() => Effect.sync(() => (sent = true))),
+        Effect.andThen(Deferred.await(answer)),
+        Effect.timeoutOrElse({
+          duration: START_TIMEOUT,
+          orElse: () =>
+            Effect.fail(voiceError(504, "timeout", "Codex didn't answer the call in time.")),
+        }),
+        Effect.map((sdpAnswer) => ({ sdpAnswer, protocolVersion: REALTIME_VERSION })),
+        // Every way out but success (an error, a timeout, the caller going away) lets the call go.
+        Effect.onExit((exit) =>
+          Effect.suspend(() => {
             call.answer = null;
-            return { sdpAnswer, protocolVersion: REALTIME_VERSION };
+            if (Exit.isSuccess(exit) || hub.calls.get(input.threadId) !== call) return Effect.void;
+            if (!sent) {
+              hub.calls.delete(input.threadId);
+              return Effect.void;
+            }
+            // Codex has a realtime session for it: stop that, and keep the call until it's closed.
+            return hub.closeCall(input.threadId, call, binding);
           }),
-          Effect.tapError(() => clear),
-        );
+        ),
+      );
     });
+  }
+
+  /** Stops `call`'s realtime session and holds it as closing until Codex says it's closed. */
+  private closeCall(threadId: string, call: Call, binding: Binding): Effect.Effect<void> {
+    call.status = "closing";
+    return binding.request("thread/realtime/stop", { threadId: binding.nativeThreadId }).pipe(
+      Effect.timeout(Duration.seconds(5)),
+      Effect.ignore,
+      Effect.andThen(
+        Effect.sleep(CLOSE_GRACE).pipe(
+          Effect.andThen(
+            Effect.sync(() => {
+              if (this.calls.get(threadId) === call) this.calls.delete(threadId);
+            }),
+          ),
+          Effect.forkDetach,
+        ),
+      ),
+      Effect.asVoid,
+    );
   }
 
   stop(input: {
@@ -284,6 +354,17 @@ export class AivaVoiceHub {
       call.status = "closing";
       return binding.request("thread/realtime/stop", { threadId: binding.nativeThreadId }).pipe(
         Effect.mapError(() => voiceError(502, "providerError", "Codex didn't stop the call.")),
+        Effect.andThen(
+          // If Codex never says closed (its session was already gone), let the call go anyway.
+          Effect.sleep(CLOSE_GRACE).pipe(
+            Effect.andThen(
+              Effect.sync(() => {
+                if (this.calls.get(input.threadId) === call) this.calls.delete(input.threadId);
+              }),
+            ),
+            Effect.forkDetach,
+          ),
+        ),
         Effect.asVoid,
       );
     });
@@ -317,6 +398,7 @@ export class AivaVoiceHub {
               ).pipe(Effect.asVoid);
         }
         case "thread/realtime/started":
+          if (call.status === "closing") return Effect.void;
           call.status = "started";
           this.emit({ type: "status", ...base, status: "started" });
           return Effect.void;
@@ -402,12 +484,10 @@ export class AivaVoiceHub {
         ),
       );
       if (!adopted) {
+        // Kept until its run claims it, however late: a run that turns up only gets a note, and
+        // must never start Codex on the request a second time.
         adoption.expired = true;
-        // Forget it later; a run that turns up after this only gets a note.
-        yield* Effect.sleep(Duration.minutes(5)).pipe(
-          Effect.andThen(Effect.sync(() => hub.adoptions.delete(messageId))),
-          Effect.forkDetach,
-        );
+        hub.pruneExpiredAdoptions();
       }
       hub.emit({ type: "turn", ...base, messageId, adopted });
       return adopted;
@@ -425,6 +505,13 @@ export class AivaVoiceHub {
       nativeTurnId: adoption.nativeTurnId,
       done: Deferred.succeed(adoption.attached, undefined).pipe(Effect.asVoid),
     };
+  }
+
+  private pruneExpiredAdoptions(): void {
+    const expired = [...this.adoptions.values()].filter((a) => a.expired);
+    for (const old of expired.slice(0, Math.max(0, expired.length - MAX_EXPIRED_ADOPTIONS))) {
+      this.adoptions.delete(old.messageId);
+    }
   }
 
   private emit(event: AivaVoiceEvent): void {
@@ -493,6 +580,29 @@ const AIVA_REALTIME_NOTIFICATIONS = [
 ] as const;
 
 export const aivaVoice = new AivaVoiceHub();
+
+const THREAD_SETTINGS_KEYS = [
+  "cwd",
+  "approvalPolicy",
+  "approvalsReviewer",
+  "sandboxPolicy",
+  "model",
+  "effort",
+  "summary",
+  "collaborationMode",
+] as const;
+
+/** `thread/settings/update` for the settings a `turn/start` would carry. */
+export function aivaThreadSettingsUpdate(
+  nativeThreadId: string,
+  turnStartParams: Readonly<Record<string, unknown>>,
+): Record<string, unknown> {
+  const update: Record<string, unknown> = { threadId: nativeThreadId };
+  for (const key of THREAD_SETTINGS_KEYS) {
+    if (turnStartParams[key] !== undefined) update[key] = turnStartParams[key];
+  }
+  return update;
+}
 
 /** The adapter, on opening an app-server: route its realtime notifications here. */
 export const aivaVoiceAttach = Effect.fn("aivaVoice.attach")(function* (
