@@ -301,17 +301,21 @@ export class AivaVoiceHub {
         if (state === "notCodex") {
           return yield* voiceError(409, "notCodex", "Voice works with Codex sessions.");
         }
-        yield* waker
-          .wake(input.threadId)
-          .pipe(
-            Effect.mapError(() =>
-              voiceError(
-                502,
-                "wakeFailed",
-                "The session's Codex agent couldn't be started for the call.",
-              ),
+        yield* waker.wake(input.threadId).pipe(
+          Effect.tapError((cause) =>
+            Effect.logWarning("aiva voice: couldn't wake the session for a call", {
+              threadId: input.threadId,
+              cause: errorText(cause),
+            }),
+          ),
+          Effect.mapError(() =>
+            voiceError(
+              502,
+              "wakeFailed",
+              "The session's Codex agent couldn't be started for the call.",
             ),
-          );
+          ),
+        );
       }
       const binding = hub.byThread.get(input.threadId);
       if (binding === undefined) return yield* notReady();
@@ -339,18 +343,17 @@ export class AivaVoiceHub {
       hub.generations.set(input.threadId, input.generation);
       let sent = false;
       const voice = input.voice?.trim();
-      // The spoken turns run with the thread's settings as they are now (access, sandbox, model),
-      // not whatever its last turn left in Codex: a turn Codex starts on its own takes those.
+      // Turns Codex starts in the call get the thread's current settings (access, sandbox, model).
+      // The call doesn't need them: if they can't be applied it starts anyway, and t3 logs why.
       const applySettings =
         hub.settingsFor === null || binding.applySettings === undefined
           ? Effect.void
           : hub.settingsFor(input.threadId).pipe(
               Effect.flatMap((settings) => binding.applySettings!(settings)),
-              Effect.mapError(() =>
-                voiceError(
-                  502,
-                  "settings",
-                  "The session's settings couldn't be applied to the call.",
+              Effect.catch((cause) =>
+                Effect.logWarning(
+                  "aiva voice: couldn't apply the thread's settings; starting the call without them",
+                  { threadId: input.threadId, cause: errorText(cause) },
                 ),
               ),
             );
@@ -366,6 +369,12 @@ export class AivaVoiceHub {
               ...(voice ? { voice } : {}),
             })
             .pipe(
+              Effect.tapError((cause) =>
+                Effect.logWarning("aiva voice: Codex refused to start the call", {
+                  threadId: input.threadId,
+                  cause: errorText(cause),
+                }),
+              ),
               Effect.mapError((cause) =>
                 voiceError(502, failureCategory(errorText(cause)), "Codex refused to start voice."),
               ),
@@ -481,15 +490,22 @@ export class AivaVoiceHub {
           return Effect.void;
         case "thread/realtime/error": {
           // The provider's own message may carry details; only its category leaves t3.
-          const failure = failureCategory(typeof p.message === "string" ? p.message : "");
+          const message = typeof p.message === "string" ? p.message : "";
+          const failure = failureCategory(message);
+          const logged = Effect.logWarning("aiva voice: Codex reported a call error", {
+            threadId: binding.appThreadId,
+            cause: message.slice(0, 500),
+          });
           if (call.answer !== null) {
-            return Deferred.fail(
-              call.answer,
-              voiceError(502, failure, "Voice couldn't start."),
-            ).pipe(Effect.asVoid);
+            return logged.pipe(
+              Effect.andThen(
+                Deferred.fail(call.answer, voiceError(502, failure, "Voice couldn't start.")),
+              ),
+              Effect.asVoid,
+            );
           }
           this.emit({ type: "status", ...base, status: "failed", failure });
-          return Effect.void;
+          return logged;
         }
         case "thread/realtime/closed": {
           this.calls.delete(binding.appThreadId);

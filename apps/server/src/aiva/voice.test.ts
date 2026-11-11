@@ -218,7 +218,7 @@ describe("aiva voice", () => {
     }),
   );
 
-  it.effect("refuses a call whose settings can't be applied, and sends Codex nothing", () =>
+  it.effect("starts the call even when the thread's settings can't be applied", () =>
     Effect.gen(function* () {
       const { hub, requests } = setup();
       hub.bindThread(
@@ -226,13 +226,22 @@ describe("aiva voice", () => {
         "native-1",
         (method, params) =>
           Effect.sync(() => void requests.push({ method, params })).pipe(Effect.as({})),
-        () => Effect.fail(new CodexAppServerRequestError({ code: -32600, errorMessage: "no" })),
+        // What node-004 got (AIV-476 live): Codex no longer had the thread loaded.
+        () =>
+          Effect.fail(
+            new CodexAppServerRequestError({
+              code: -32600,
+              errorMessage: "thread not found: native-1",
+            }),
+          ),
       );
       hub.setSettingsSource(() => Effect.succeed({ runtimePolicy: {}, modelSelection: {} }));
-      const error = yield* Effect.flip(startCall(hub));
-      assert.strictEqual(error.code, "settings");
-      assert.deepStrictEqual(requests, []);
-      assert.strictEqual(hub.status("thread-1").call, null);
+      const starting = yield* Effect.forkChild(startCall(hub));
+      yield* Effect.yieldNow;
+      // Settings only steer the turns Codex starts in the call; the call itself goes ahead.
+      assert.strictEqual(requests.at(-1)?.method, "thread/realtime/start");
+      yield* hub.notification("thread/realtime/sdp", { threadId: "native-1", sdp: "answer" });
+      assert.strictEqual((yield* Fiber.join(starting)).sdpAnswer, "answer");
     }),
   );
 
