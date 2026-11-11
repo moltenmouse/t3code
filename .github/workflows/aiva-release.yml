@@ -31,6 +31,41 @@ concurrency:
   group: aiva-release
   cancel-in-progress: false
 
+env:
+  # Installs Ubuntu packages (the arguments) on a runner whose own mirror may be unreachable:
+  # apt retries with short timeouts, an `update` that fails for some sources goes on to the
+  # install, and a failed install moves the apt sources to other mirrors, one by one, skipping
+  # any whose name doesn't resolve. Run as `bash -c "$AIVA_APT_INSTALL" apt-install <packages>`
+  # (inline, as a dispatch may build a commit from before this script existed).
+  AIVA_APT_INSTALL: |
+    set -euo pipefail
+    apt=(sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
+    try() {
+      "${apt[@]}" update || echo "::warning::apt-get update failed for some sources; installing from the lists it has"
+      "${apt[@]}" install -y "$@"
+    }
+    try "$@" && exit 0
+    resolved=0
+    for mirror in http://archive.ubuntu.com/ubuntu http://mirrors.edge.kernel.org/ubuntu https://mirror.math.princeton.edu/pub/ubuntu; do
+      host="${mirror#*://}"; host="${host%%/*}"
+      if ! getent hosts "$host" >/dev/null; then
+        echo "::warning::$host doesn't resolve on this runner"
+        continue
+      fi
+      resolved=1
+      echo "Installing from $mirror instead"
+      for f in ${AIVA_APT_SOURCES:-/etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list}; do
+        [ -f "$f" ] && sudo sed -i -E "s#https?://[^ ]+/ubuntu/?( |\$)#${mirror}/\1#g" "$f"
+      done
+      try "$@" && exit 0
+    done
+    if [ "$resolved" = 0 ]; then
+      echo "::error::No Ubuntu mirror resolves on this runner (DNS down?); try again later"
+    else
+      echo "::error::$* couldn't be installed from any Ubuntu mirror"
+    fi
+    exit 1
+
 jobs:
   version:
     name: Resolve version
@@ -82,14 +117,8 @@ jobs:
           echo "script=$script" >> "$GITHUB_OUTPUT"
       - name: Install browser secret helper build libraries
         if: steps.bundle_build.outputs.script == 'build:desktop'
-        timeout-minutes: 10
-        run: |
-          set -euo pipefail
-          apt=(sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
-          # An unreachable source (security.ubuntu.com, say) fails `update` though the main
-          # archive's lists came through; the install is what has to succeed.
-          "${apt[@]}" update || echo "::warning::apt-get update failed for some sources; installing from the lists it has"
-          "${apt[@]}" install -y libsecret-1-dev pkg-config
+        timeout-minutes: 20
+        run: bash -c "$AIVA_APT_INSTALL" apt-install libsecret-1-dev pkg-config
       - name: Build JS bundle
         env:
           T3CODE_TELEMETRY_CHANNEL: dev
@@ -185,13 +214,8 @@ jobs:
           unzip -p "$dir/$name.zip" "$name/node.exe" > "$dest/node.exe"
       - name: Install patchelf
         if: matrix.platform == 'linux'
-        timeout-minutes: 10
-        run: |
-          set -euo pipefail
-          command -v patchelf && exit 0
-          apt=(sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
-          "${apt[@]}" update || echo "::warning::apt-get update failed for some sources; installing from the lists it has"
-          "${apt[@]}" install -y patchelf
+        timeout-minutes: 20
+        run: command -v patchelf || bash -c "$AIVA_APT_INSTALL" apt-install patchelf
       - name: Apply web client branding
         run: node scripts/apply-web-brand-assets.ts production apps/server/dist/client
       - name: Build CLI single-executable
