@@ -2052,13 +2052,10 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           });
         });
 
-        const rememberRootProviderThread = Effect.fnUntraced(function* (
-          providerThread: OrchestrationV2ProviderThread,
-        ) {
+        // P11: a root thread can take voice calls once loaded (by a turn, or resumed for a call).
+        const bindVoice = (providerThread: OrchestrationV2ProviderThread) => {
           const nativeThreadId = providerThread.nativeThreadRef?.nativeId;
-          if (nativeThreadId == null) return;
-          rootProviderThreads.set(nativeThreadId, providerThread);
-          if (providerThread.appThreadId !== null) {
+          if (nativeThreadId != null && providerThread.appThreadId !== null) {
             aivaVoice.bindThread(
               providerThread.appThreadId,
               nativeThreadId,
@@ -2082,6 +2079,15 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 ),
             );
           }
+        };
+
+        const rememberRootProviderThread = Effect.fnUntraced(function* (
+          providerThread: OrchestrationV2ProviderThread,
+        ) {
+          const nativeThreadId = providerThread.nativeThreadRef?.nativeId;
+          if (nativeThreadId == null) return;
+          rootProviderThreads.set(nativeThreadId, providerThread);
+          bindVoice(providerThread);
           yield* emitGoalUpdate(nativeThreadId);
         });
 
@@ -7088,6 +7094,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           canReuseContextUsage: canReuseCodexContextUsage,
           // Idle release can beat delayed subagent resumes: Codex reports them completed between turns with no resume-expected signal.
           hasPendingBackgroundWork: Effect.gen(function* () {
+            if (aivaVoice.holds(client.raw.request)) return true;
             for (const items of (yield* Ref.get(runningCommandItemsByTurn)).values()) {
               if (items.size > 0) {
                 return true;
@@ -7114,6 +7121,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           hasPendingBackgroundWorkForThread: Effect.fn(
             "CodexAdapterV2.hasPendingBackgroundWorkForThread",
           )(function* (providerThread) {
+            if (aivaVoice.holdsNative(providerThread.nativeThreadRef?.nativeId)) return true;
             const contexts = [
               ...(yield* Ref.get(activeTurns)).values(),
               ...(yield* Ref.get(settledTurns)).values(),
@@ -7187,7 +7195,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 Effect.andThen(resume),
                 Effect.flatMap(decodeCodexResumeMetadata),
               );
-              return {
+              const resumed = {
                 ...threadInput.providerThread,
                 providerSessionId: input.providerSessionId,
                 providerInstanceId: adapterOptions.instanceId,
@@ -7200,6 +7208,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 nativeConversationHeadRef: threadInput.providerThread.nativeConversationHeadRef,
                 updatedAt: codexTimestamp(response.thread.updatedAt),
               } satisfies OrchestrationV2ProviderThread;
+              bindVoice(resumed);
+              return resumed;
             },
             (effect, threadInput) =>
               effect.pipe(

@@ -80,6 +80,17 @@ export interface AivaVoiceSettings {
   readonly runtimePolicy: unknown;
   readonly modelSelection: unknown;
 }
+/**
+ * How a call reaches a session whose app-server t3 has let go (idle sessions are released, idle
+ * threads unloaded): open its provider session and resume its native thread, as a turn would,
+ * without starting one. `readiness` says whether that's possible: `neverRun` for a session Codex
+ * hasn't run yet (no native thread to resume), `notCodex` for another agent's.
+ */
+export interface AivaVoiceWaker {
+  readonly readiness: (threadId: string) => Effect.Effect<"ready" | "neverRun" | "notCodex", Error>;
+  readonly wake: (threadId: string) => Effect.Effect<void, Error>;
+}
+
 /** The adapter's way to put `settings` on the thread before a call (`thread/settings/update`). */
 export type AivaVoiceApplySettings = (settings: AivaVoiceSettings) => Effect.Effect<void, Error>;
 
@@ -126,6 +137,7 @@ export class AivaVoiceHub {
   private dispatch: AivaVoiceDispatch | null = null;
   private settingsFor: ((threadId: string) => Effect.Effect<AivaVoiceSettings, Error>) | null =
     null;
+  private waker: AivaVoiceWaker | null = null;
   readonly enabled: () => boolean;
 
   constructor(enabled: () => boolean = () => loadAivaSettings() !== null) {
@@ -135,6 +147,42 @@ export class AivaVoiceHub {
   /** The route layer hands over t3's command dispatch once the server is up. */
   setDispatch(dispatch: AivaVoiceDispatch | null): void {
     this.dispatch = dispatch;
+  }
+
+  /** The route layer hands over how to bring an idle session's app-server back for a call. */
+  setWaker(waker: AivaVoiceWaker | null): void {
+    this.waker = waker;
+  }
+
+  /**
+   * While a call runs, its session and thread count as busy, so t3 neither releases the
+   * app-server nor unloads the thread; afterwards they go idle and are let go as usual.
+   */
+  holds(request: AivaVoiceRequest): boolean {
+    for (const [threadId, binding] of this.byThread) {
+      if (binding.request === request && this.calls.has(threadId)) return true;
+    }
+    return false;
+  }
+
+  holdsNative(nativeThreadId: string | null | undefined): boolean {
+    const binding = nativeThreadId == null ? undefined : this.byNative.get(nativeThreadId);
+    return binding !== undefined && this.calls.has(binding.appThreadId);
+  }
+
+  /** `status`, and whether a call can start now: bound, or an idle Codex session t3 can wake. */
+  readiness(appThreadId: string) {
+    const status = this.status(appThreadId);
+    if (status.ready || this.waker === null)
+      return Effect.succeed({ ...status, reason: status.ready ? null : "notReady" });
+    return this.waker.readiness(appThreadId).pipe(
+      Effect.map((state) => ({
+        ...status,
+        ready: state === "ready",
+        reason: state === "ready" ? null : state,
+      })),
+      Effect.orElseSucceed(() => ({ ...status, reason: "notReady" })),
+    );
   }
 
   /** The route layer hands over how to read a thread's current settings (runtime policy, model). */
@@ -235,6 +283,35 @@ export class AivaVoiceHub {
         new TextEncoder().encode(input.sdpOffer).length > AIVA_VOICE_MAX_SDP_BYTES
       ) {
         return yield* voiceError(400, "invalid", "sdpOffer is missing or too large.");
+      }
+      if (hub.calls.has(input.threadId)) {
+        const busy = hub.calls.get(input.threadId)!;
+        return yield* busy.status === "closing"
+          ? voiceError(409, "busy", "The last call is still closing. Try again in a moment.")
+          : voiceError(409, "busy", "A voice call is already running in this session.");
+      }
+      // The session's app-server may have been let go since its last turn: bring it back (and
+      // its thread loaded) first. A no-op when it's up.
+      if (hub.waker !== null) {
+        const waker = hub.waker;
+        const state = yield* waker
+          .readiness(input.threadId)
+          .pipe(Effect.orElseSucceed(() => "ready" as const));
+        if (state === "neverRun") return yield* notReady();
+        if (state === "notCodex") {
+          return yield* voiceError(409, "notCodex", "Voice works with Codex sessions.");
+        }
+        yield* waker
+          .wake(input.threadId)
+          .pipe(
+            Effect.mapError(() =>
+              voiceError(
+                502,
+                "wakeFailed",
+                "The session's Codex agent couldn't be started for the call.",
+              ),
+            ),
+          );
       }
       const binding = hub.byThread.get(input.threadId);
       if (binding === undefined) return yield* notReady();
@@ -529,7 +606,7 @@ function notReady(): AivaVoiceError {
   return voiceError(
     409,
     "notReady",
-    "This session's agent isn't running in t3 yet. Send it a message, then start voice.",
+    "Codex hasn't run in this session yet. Send it a message, then start voice.",
   );
 }
 

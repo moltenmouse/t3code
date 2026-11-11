@@ -369,4 +369,80 @@ describe("aiva voice", () => {
     assert.strictEqual(failureCategory("boom"), "providerError");
     assert.strictEqual(failureCategory(""), "providerError");
   });
+
+  describe("an idle session (AIV-494)", () => {
+    const unbound = () => {
+      const hub = new AivaVoiceHub(() => true);
+      const requests: Array<{ method: string; params: unknown }> = [];
+      const request = (method: string, params: unknown) =>
+        Effect.sync(() => void requests.push({ method, params })).pipe(Effect.as({}));
+      return { hub, requests, request };
+    };
+
+    it.effect("wakes the session's app-server for a call, then holds it while the call runs", () =>
+      Effect.gen(function* () {
+        const { hub, requests, request } = unbound();
+        let woken = 0;
+        hub.setWaker({
+          readiness: () => Effect.succeed("ready"),
+          // t3 opens the session and resumes the thread; the adapter binds it on resume.
+          wake: () =>
+            Effect.sync(() => {
+              woken += 1;
+              hub.bindThread("thread-1", "native-1", request);
+            }),
+        });
+        const ready = yield* hub.readiness("thread-1");
+        assert.isTrue(ready.ready);
+        assert.isFalse(hub.holds(request));
+        const starting = yield* Effect.forkChild(startCall(hub));
+        yield* Effect.yieldNow;
+        assert.strictEqual(woken, 1);
+        assert.strictEqual(requests.at(-1)?.method, "thread/realtime/start");
+        assert.isTrue(hub.holds(request), "the app-server stays while the call runs");
+        assert.isTrue(hub.holdsNative("native-1"), "and its thread stays loaded");
+        yield* hub.notification("thread/realtime/sdp", { threadId: "native-1", sdp: "answer" });
+        yield* Fiber.join(starting);
+        yield* hub.notification("thread/realtime/closed", {
+          threadId: "native-1",
+          reason: "requested",
+        });
+        assert.isFalse(hub.holds(request), "then it's let go as usual");
+        assert.isFalse(hub.holdsNative("native-1"));
+      }),
+    );
+
+    it.effect("still asks for a message first in a session Codex has never run", () =>
+      Effect.gen(function* () {
+        const { hub } = unbound();
+        hub.setWaker({
+          readiness: () => Effect.succeed("neverRun"),
+          wake: () => Effect.die("not woken"),
+        });
+        assert.deepInclude(yield* hub.readiness("thread-1"), { ready: false, reason: "neverRun" });
+        const error = yield* Effect.flip(startCall(hub));
+        assert.strictEqual(error.code, "notReady");
+        assert.include(error.message, "Send it a message");
+      }),
+    );
+
+    it.effect("says so when the session's agent isn't Codex, or can't be started", () =>
+      Effect.gen(function* () {
+        const { hub } = unbound();
+        hub.setWaker({
+          readiness: () => Effect.succeed("notCodex"),
+          wake: () => Effect.die("not woken"),
+        });
+        assert.strictEqual((yield* Effect.flip(startCall(hub))).code, "notCodex");
+        hub.setWaker({
+          readiness: () => Effect.succeed("ready"),
+          wake: () =>
+            Effect.fail(new CodexAppServerRequestError({ code: -1, errorMessage: "spawn failed" })),
+        });
+        const error = yield* Effect.flip(startCall(hub, 2));
+        assert.strictEqual(error.code, "wakeFailed");
+        assert.strictEqual(hub.status("thread-1").call, null);
+      }),
+    );
+  });
 });
