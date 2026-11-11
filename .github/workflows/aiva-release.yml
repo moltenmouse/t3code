@@ -82,7 +82,14 @@ jobs:
           echo "script=$script" >> "$GITHUB_OUTPUT"
       - name: Install browser secret helper build libraries
         if: steps.bundle_build.outputs.script == 'build:desktop'
-        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          apt=(sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
+          # An unreachable source (security.ubuntu.com, say) fails `update` though the main
+          # archive's lists came through; the install is what has to succeed.
+          "${apt[@]}" update || echo "::warning::apt-get update failed for some sources; installing from the lists it has"
+          "${apt[@]}" install -y libsecret-1-dev pkg-config
       - name: Build JS bundle
         env:
           T3CODE_TELEMETRY_CHANNEL: dev
@@ -178,7 +185,13 @@ jobs:
           unzip -p "$dir/$name.zip" "$name/node.exe" > "$dest/node.exe"
       - name: Install patchelf
         if: matrix.platform == 'linux'
-        run: command -v patchelf || { sudo apt-get update && sudo apt-get install -y patchelf; }
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          command -v patchelf && exit 0
+          apt=(sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
+          "${apt[@]}" update || echo "::warning::apt-get update failed for some sources; installing from the lists it has"
+          "${apt[@]}" install -y patchelf
       - name: Apply web client branding
         run: node scripts/apply-web-brand-assets.ts production apps/server/dist/client
       - name: Build CLI single-executable
