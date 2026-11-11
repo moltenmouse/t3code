@@ -9384,14 +9384,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         payload: taskTurnItem,
       });
 
-      // Aiva P8: a forked child branches the parent's agent conversation.
-      // Record a pending fork transfer from the parent's latest stable run to
-      // the child, exactly as `thread.fork` does; the child's first message
-      // (dispatched below) picks it up and the provider branches the parent's
-      // native conversation under a new native id (falling back to a portable
-      // copy when it can't). The parent's own native history is untouched. A
-      // parent with no finished run yet has nothing to branch: the child then
-      // starts as an ordinary subagent.
+      // Aiva P8: a forked child gets a pending fork transfer from the parent's latest stable run,
+      // exactly as `thread.fork` makes; its first message (below) picks it up. The parent's own
+      // native history is untouched; a parent with no finished run gives an ordinary subagent.
       if (command.forkContext === true) {
         const sourceRun = runForSourcePoint(
           { ...parentProjection, checkpoints: [] },
@@ -9422,7 +9417,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           yield* emitEvent({
             type: "context-transfer.created",
             threadId: childThreadId,
-            providerInstanceId: transfer.sourceProviderInstanceId ?? command.modelSelection.instanceId,
+            providerInstanceId:
+              transfer.sourceProviderInstanceId ?? command.modelSelection.instanceId,
             occurredAt: now,
             payload: transfer,
           });

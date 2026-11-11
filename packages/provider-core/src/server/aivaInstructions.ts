@@ -1,26 +1,21 @@
 // @effect-diagnostics nodeBuiltinImport:off -- read once while the instruction constants load.
 /**
- * Removes the parts of t3's agent instructions that are about tools Aiva hides
- * from agents (`disabledTools` in `aiva.json`; see apps/server/src/aiva/settings.ts,
- * which reads the same file for everything else). In a bullet that names a
- * hidden tool, that sentence goes, with the sentences after it that carry on
- * about it (up to the next one naming some other tool); the rest of the bullet
- * stays, and a bullet left empty goes. Every other word stays as upstream wrote it.
- *
- * Read once, when the instructions load: changing the hidden tools needs a restart.
+ * Drops the sentences of t3's agent instructions about tools hidden by `disabledTools` in
+ * `aiva.json`, with the ones after that carry on about them, and bullets left empty; every other
+ * word stays as upstream wrote it. Read once at load: changing the hidden tools needs a restart.
  */
-import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 
 const TOOL_NAME = /^[A-Za-z0-9_-]{1,128}$/;
 
 export function aivaDisabledTools(env: NodeJS.ProcessEnv = process.env): ReadonlyArray<string> {
   const path =
     env.T3CODE_AIVA_SETTINGS?.trim() ||
-    join(env.T3CODE_HOME?.trim() || join(homedir(), ".t3"), "aiva.json");
+    NodePath.join(env.T3CODE_HOME?.trim() || NodePath.join(NodeOS.homedir(), ".t3"), "aiva.json");
   try {
-    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+    const parsed: unknown = JSON.parse(NodeFS.readFileSync(path, "utf8"));
     const tools =
       typeof parsed === "object" && parsed !== null && "disabledTools" in parsed
         ? parsed.disabledTools

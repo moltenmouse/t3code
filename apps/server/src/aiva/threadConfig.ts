@@ -1,14 +1,7 @@
 /**
- * Per-thread agent configuration from `aiva.json` (see settings.ts), applied
- * where t3 builds a thread's Codex config and Claude query options:
- *
- * - extra MCP servers, with the thread's id and token in the URL or headers
- * - t3 MCP tools hidden from agents
- * - native sub-agents (Codex `multi_agent`, Claude `Agent` and agent teams) off
- *   unless allowed for the thread
- * - extra environment for the thread's commands
- *
- * Without settings, both functions return their input unchanged.
+ * Per-thread agent configuration from `aiva.json` (see settings.ts), applied where t3 builds a
+ * thread's Codex config and Claude query options: extra MCP servers, hidden t3 tools, native
+ * sub-agents off unless allowed, extra command env. Without settings, input is returned unchanged.
  */
 import {
   type AivaSettings,
