@@ -32,29 +32,40 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # Installs Ubuntu packages (the arguments) on a runner whose own mirror may be unreachable:
-  # apt retries with short timeouts, an `update` that fails for some sources goes on to the
-  # install, and a failed install moves the apt sources to other mirrors, one by one, skipping
-  # any whose name doesn't resolve. Run as `bash -c "$AIVA_APT_INSTALL" apt-install <packages>`
-  # (inline, as a dispatch may build a commit from before this script existed).
+  # Installs Ubuntu packages (the arguments) on a runner whose own mirror may be unreachable.
+  # Each attempt is capped (update 90 s, install 150 s; apt requests time out after 10 s): first
+  # the runner's own mirror, unless its name doesn't resolve, then other mirrors in turn, the apt
+  # sources moved to each, skipping any whose name doesn't resolve. An `update` that fails for
+  # some sources goes on to the install. Run as `bash -c "$AIVA_APT_INSTALL" apt-install
+  # <packages>` (inline, as a dispatch may build a commit from before this script existed).
   AIVA_APT_INSTALL: |
     set -euo pipefail
-    apt=(sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
+    opts=(-o Acquire::Retries=2 -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10)
+    sources="${AIVA_APT_SOURCES:-/etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list}"
     try() {
-      "${apt[@]}" update || echo "::warning::apt-get update failed for some sources; installing from the lists it has"
-      "${apt[@]}" install -y "$@"
+      sudo dpkg --configure -a >/dev/null 2>&1 || true
+      sudo timeout 90 apt-get "${opts[@]}" update || echo "::warning::apt-get update failed or timed out for some sources; installing from the lists it has"
+      sudo timeout 150 apt-get "${opts[@]}" install -y "$@"
     }
-    try "$@" && exit 0
+    resolves() { getent hosts "$1" >/dev/null; }
+    # The runner's own mirror: the first host in its apt sources.
+    own="$(grep -hoE 'https?://[^/ ]+' $sources 2>/dev/null | head -n 1 | sed -E 's#https?://##' || true)"
+    if [ -n "$own" ] && resolves "$own"; then
+      try "$@" && exit 0
+      echo "::warning::$* didn't install from $own; trying other mirrors"
+    else
+      echo "::warning::${own:-The configured mirror} doesn't resolve on this runner; trying other mirrors"
+    fi
     resolved=0
     for mirror in http://archive.ubuntu.com/ubuntu http://mirrors.edge.kernel.org/ubuntu https://mirror.math.princeton.edu/pub/ubuntu; do
       host="${mirror#*://}"; host="${host%%/*}"
-      if ! getent hosts "$host" >/dev/null; then
+      if ! resolves "$host"; then
         echo "::warning::$host doesn't resolve on this runner"
         continue
       fi
       resolved=1
       echo "Installing from $mirror instead"
-      for f in ${AIVA_APT_SOURCES:-/etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list}; do
+      for f in $sources; do
         [ -f "$f" ] && sudo sed -i -E "s#https?://[^ ]+/ubuntu/?( |\$)#${mirror}/\1#g" "$f"
       done
       try "$@" && exit 0
