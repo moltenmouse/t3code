@@ -53,6 +53,7 @@ import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import { randomUuidV4 } from "@t3tools/provider-core/server/randomUuid";
 import { DispatchModeLimit } from "./DispatchModeLimit.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
+import { recordAivaWorktree } from "../aiva/worktrees.ts";
 
 export type ThreadLaunchWorkspaceStrategy =
   | { readonly type: "root"; readonly branch?: string | undefined }
@@ -461,6 +462,7 @@ const make = Effect.gen(function* () {
         branch = worktree.worktree.refName;
         createdWorktreePath = worktreePath;
         createdBranch = branch;
+        yield* Effect.sync(() => recordAivaWorktree(threadId, worktree.worktree.path));
         yield* setupTracker.update(threadId, (snapshot) => ({ ...snapshot, worktreePath, branch }));
         yield* setupTracker.stageStatus(threadId, "checkout", "done");
       }
