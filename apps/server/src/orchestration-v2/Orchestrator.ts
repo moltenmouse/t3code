@@ -7909,58 +7909,47 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         payload: taskTurnItem,
       });
 
-      // Aiva P8: a forked child continues the parent's native agent session.
-      // Give the child a provider thread that is a strong native reference to
-      // the parent's current native session, emitted before its first message
-      // dispatches, so the first turn resumes that conversation with the
-      // parent's full context instead of starting the agent blank. If the
-      // parent exposes no strong native session, fall through to an ordinary
-      // fresh subagent (the caller keeps a task summary as a fallback).
+      // Aiva P8: a forked child branches the parent's agent conversation.
+      // Record a pending fork transfer from the parent's latest stable run to
+      // the child, exactly as `thread.fork` does; the child's first message
+      // (dispatched below) picks it up and the provider branches the parent's
+      // native conversation under a new native id (falling back to a portable
+      // copy when it can't). The parent's own native history is untouched. A
+      // parent with no finished run yet has nothing to branch: the child then
+      // starts as an ordinary subagent.
       if (command.forkContext === true) {
-        const parentNative = parentProjection.providerThreads.find(
-          (candidate) =>
-            candidate.id === parentProjection.thread.activeProviderThreadId &&
-            candidate.nativeThreadRef !== null &&
-            candidate.nativeThreadRef.strength === "strong" &&
-            candidate.nativeThreadRef.nativeId !== null,
+        const sourceRun = runForSourcePoint(
+          { ...parentProjection, checkpoints: [] },
+          { type: "latest_stable" },
         );
-        const parentNativeId = parentNative?.nativeThreadRef?.nativeId ?? null;
-        if (parentNativeId !== null) {
-          const driver = targetAdapter.driver;
-          const nativeThreadRef = {
-            driver,
-            nativeId: parentNativeId,
-            strength: "strong" as const,
-          };
-          yield* emitEvent({
-            type: "provider-thread.updated",
-            threadId: childThreadId,
-            driver,
-            providerInstanceId: command.modelSelection.instanceId,
-            occurredAt: now,
-            payload: {
-              id: idAllocator.derive.providerThread({
-                driver,
-                providerInstanceId: command.modelSelection.instanceId,
-                nativeThreadId: nativeThreadRef.nativeId,
-              }),
-              driver,
-              providerInstanceId: command.modelSelection.instanceId,
-              providerSessionId: null,
-              appThreadId: childThreadId,
-              ownerNodeId: null,
-              nativeThreadRef,
-              nativeConversationHeadRef: null,
-              status: "not_loaded",
-              firstRunOrdinal: null,
-              lastRunOrdinal: null,
-              handoffIds: [],
-              forkedFrom: null,
-              contextUsage: null,
-              nativeMetadata: null,
+        if (sourceRun !== null) {
+          const transferId = yield* mapDispatchError(command)(
+            idAllocator.allocate.contextTransfer({
+              sourceThreadId: command.parentThreadId,
+              targetThreadId: childThreadId,
+              type: "fork",
+            }),
+          );
+          const { transfer } = yield* threadForkService
+            .plan({
+              sourceProjection: parentProjection,
+              sourceRun,
+              sourceProviderThread: providerThreadForRun(parentProjection, sourceRun),
+              sourceTokenUsage: providerTurnForRun(parentProjection, sourceRun)?.tokenUsage,
+              canonicalSourcePoint: contextSourcePointForRun(parentProjection, sourceRun),
+              transferId,
+              targetThreadId: childThreadId,
+              createdBy: command.createdBy,
+              creationSource: command.creationSource,
               createdAt: now,
-              updatedAt: now,
-            },
+            })
+            .pipe(mapDispatchError(command));
+          yield* emitEvent({
+            type: "context-transfer.created",
+            threadId: childThreadId,
+            providerInstanceId: transfer.sourceProviderInstanceId ?? command.modelSelection.instanceId,
+            occurredAt: now,
+            payload: transfer,
           });
         }
       }
