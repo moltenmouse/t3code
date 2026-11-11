@@ -16,6 +16,7 @@ import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
+import * as ProviderSessionManager from "../orchestration-v2/ProviderSessionManager.ts";
 import * as RuntimePolicy from "../orchestration-v2/RuntimePolicy.ts";
 import { requestUrl } from "../requestUrl.ts";
 import { AivaVoiceError, aivaVoice, type AivaVoiceEvent, type AivaVoiceHub } from "./voice.ts";
@@ -83,7 +84,7 @@ const routes = (hub: AivaVoiceHub) =>
       "GET",
       `${PREFIX}/status`,
       guarded(hub, (request) =>
-        threadParam(request).pipe(Effect.map((threadId) => hub.status(threadId))),
+        threadParam(request).pipe(Effect.flatMap((threadId) => hub.readiness(threadId))),
       ),
     ),
     HttpRouter.add(
@@ -189,10 +190,75 @@ const dispatcher = Layer.effectDiscard(
         ),
       ),
     );
+    // An idle session's app-server (released after a while) comes back for a call as it would for
+    // a turn: t3's own session manager opens the session and resumes the native thread.
+    const sessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
+    const codexThread = (threadId: string) =>
+      projections.getThread(ThreadId.make(threadId)).pipe(
+        // Provider threads come back only for the instance asked about: the thread's own.
+        Effect.flatMap((thread) =>
+          projections.getThreadProviderContext(thread.id, thread.modelSelection.instanceId),
+        ),
+        Effect.map((context) => {
+          const providerThread = context.providerThreads.find(
+            (candidate) => candidate.id === context.thread.activeProviderThreadId,
+          );
+          return { context, providerThread };
+        }),
+      );
+    aivaVoice.setWaker({
+      readiness: (threadId) =>
+        codexThread(threadId).pipe(
+          Effect.map(({ providerThread }) =>
+            providerThread === undefined ||
+            providerThread.providerSessionId === null ||
+            !providerThread.nativeThreadRef?.nativeId
+              ? ("neverRun" as const)
+              : providerThread.nativeThreadRef.driver === "codex"
+                ? ("ready" as const)
+                : ("notCodex" as const),
+          ),
+        ),
+      wake: Effect.fn("aivaVoice.wake")(function* (threadId: string) {
+        const { context, providerThread } = yield* codexThread(threadId);
+        const providerSessionId = providerThread?.providerSessionId;
+        const nativeThreadId = providerThread?.nativeThreadRef?.nativeId;
+        if (providerThread === undefined || providerSessionId == null || !nativeThreadId) return;
+        const thread = context.thread;
+        const policy = yield* runtimePolicy.resolve({
+          thread,
+          modelSelection: thread.modelSelection,
+        });
+        const resumeFromSession = context.providerSessions.find(
+          (candidate) => candidate.id === providerSessionId,
+        );
+        const session = yield* sessions.open({
+          threadId: thread.id,
+          providerSessionId,
+          modelSelection: thread.modelSelection,
+          runtimePolicy: policy,
+          ...(resumeFromSession === undefined ? {} : { resumeFromSession }),
+          initialNativeThreadId: nativeThreadId,
+          ...(providerThread.nativeMetadata?.itemIdentityVersion === undefined
+            ? {}
+            : {
+                initialProviderItemIdentityVersion:
+                  providerThread.nativeMetadata.itemIdentityVersion,
+              }),
+        });
+        yield* session.resumeThread({
+          providerThread,
+          threadId: thread.id,
+          modelSelection: thread.modelSelection,
+          runtimePolicy: policy,
+        });
+      }),
+    });
     yield* Effect.addFinalizer(() =>
       Effect.sync(() => {
         aivaVoice.setDispatch(null);
         aivaVoice.setSettingsSource(null);
+        aivaVoice.setWaker(null);
       }),
     );
   }),

@@ -26,7 +26,9 @@ import * as CodexClient from "effect-codex-app-server/client";
 import * as CodexReplay from "effect-codex-app-server/replay";
 import * as Digest from "effect/crypto/Digest";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as PubSub from "effect/PubSub";
@@ -460,5 +462,148 @@ describe("voice turns in the Codex adapter (P11)", () => {
       assert.notInclude(JSON.stringify(writes), "secret");
       assert.include(JSON.stringify(writes), "[REDACTED]");
     }),
+  );
+
+  it.effect(
+    "takes a call on a session no turn has loaded: resumed, held, then let go (AIV-494)",
+    () => {
+      const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "aiva-voice-"));
+      NodeFS.writeFileSync(NodePath.join(dir, "aiva.json"), "{}");
+      process.env.T3CODE_AIVA_SETTINGS = NodePath.join(dir, "aiva.json");
+      const resumeParams = {
+        threadId: NATIVE_THREAD,
+        excludeTurns: true,
+        ...aivaCodexThreadParams(THREAD_ID, {
+          cwd: "/workspace",
+          model: "gpt-5.4",
+          config: CodexAdapterV2.CODEX_THREAD_CONFIG,
+        }),
+      };
+      const entries: Array<CodexReplay.CodexAppServerReplayEntry> = [
+        ...transcript({}).entries.slice(0, 5),
+        // No turn: t3 resumes the native thread for the call, as a turn would.
+        out(3, "thread/resume", resumeParams),
+        reply(3, { thread: { id: NATIVE_THREAD, updatedAt: 1782622500 } }),
+        out(4, "thread/realtime/start", {
+          threadId: NATIVE_THREAD,
+          outputModality: "audio",
+          version: "v3",
+          includeStartupContext: true,
+          transport: { type: "webrtc", sdp: "offer" },
+        }),
+        reply(4, {}),
+        notify("thread/realtime/sdp", { threadId: NATIVE_THREAD, sdp: "answer" }),
+        notify("thread/realtime/started", {
+          threadId: NATIVE_THREAD,
+          realtimeSessionId: null,
+          version: "v3",
+        }),
+        out(5, "thread/realtime/stop", { threadId: NATIVE_THREAD }),
+        reply(5, {}),
+        notify("thread/realtime/closed", { threadId: NATIVE_THREAD, reason: "requested" }),
+      ];
+      return Effect.gen(function* () {
+        const driver = yield* CodexReplay.makeReplayDriver({
+          provider: "codex",
+          protocol: "codex.app-server",
+          version: "0.159.0",
+          scenario: SCENARIO,
+          entries,
+        });
+        const adapter = yield* CodexAdapterV2.makeCodexAdapterV2({
+          instanceId: CodexAdapterV2.CODEX_DEFAULT_INSTANCE_ID,
+          settings: SETTINGS,
+          environment: {},
+          clientFactory: {
+            open: (openInput) =>
+              Layer.build(CodexReplay.layerReplayWithDriver(driver)).pipe(
+                Effect.flatMap((context) =>
+                  Effect.service(CodexClient.CodexAppServerClient).pipe(Effect.provide(context)),
+                ),
+                Effect.mapError(
+                  (cause) =>
+                    new ProviderAdapter.ProviderAdapterOpenSessionError({
+                      driver: CodexAdapterV2.CODEX_DRIVER_KIND,
+                      providerSessionId: openInput.providerSessionId,
+                      cause,
+                    }),
+                ),
+              ),
+          },
+          digest: yield* Digest.Digest,
+          fileSystem: yield* FileSystem.FileSystem,
+          idAllocator: yield* IdAllocator.IdAllocatorV2,
+          serverConfig: yield* ProviderReplayHarness.makeReplayServerConfig(SCENARIO).pipe(
+            Effect.orDie,
+          ),
+          continuationRequests: { offer: () => Effect.void },
+        });
+        const runtime = yield* adapter.openSession({
+          threadId: THREAD_ID,
+          providerSessionId: ProviderSessionId.make(`provider-session-${SCENARIO}`),
+          modelSelection: MODEL,
+          runtimePolicy: POLICY,
+        });
+        const created = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: MODEL,
+          runtimePolicy: POLICY,
+        });
+        // Before anything resumes it, this session can't take a call (a bare hub can't wake it).
+        assert.isFalse(aivaVoice.status(THREAD_ID).ready);
+        const resumed = yield* runtime.resumeThread({
+          providerThread: created,
+          threadId: THREAD_ID,
+          modelSelection: MODEL,
+          runtimePolicy: POLICY,
+        });
+        assert.isTrue(
+          aivaVoice.status(THREAD_ID).ready,
+          "resuming the thread makes it ready for a call",
+        );
+        assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
+
+        const call = yield* aivaVoice.start({
+          threadId: THREAD_ID,
+          voiceSessionId: "idle-call",
+          generation: 99,
+          sdpOffer: "offer",
+        });
+        assert.strictEqual(call.sdpAnswer, "answer");
+        assert.isTrue(
+          yield* runtime.hasPendingBackgroundWork!,
+          "t3 keeps the app-server while the call runs",
+        );
+        assert.isTrue(
+          yield* runtime.hasPendingBackgroundWorkForThread!(resumed),
+          "and the thread loaded",
+        );
+
+        const closed = yield* Deferred.make<void>();
+        const unsubscribe = aivaVoice.subscribe((event) => {
+          if (event.type === "status" && event.status === "closed")
+            Deferred.doneUnsafe(closed, Exit.void);
+        });
+        yield* aivaVoice.stop({ threadId: THREAD_ID, voiceSessionId: "idle-call", generation: 99 });
+        yield* Deferred.await(closed);
+        unsubscribe();
+        assert.strictEqual(aivaVoice.status(THREAD_ID).call, null);
+        assert.isFalse(
+          yield* runtime.hasPendingBackgroundWork!,
+          "after the call it goes idle as usual",
+        );
+        assert.isFalse(yield* runtime.hasPendingBackgroundWorkForThread!(resumed));
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            NodeCrypto.layer,
+          ),
+        ),
+      );
+    },
   );
 });
