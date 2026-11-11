@@ -103,6 +103,7 @@ import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { resolveAttachmentPath, resolveAttachmentPathById } from "../../attachmentStore.ts";
 import * as PortScanner from "../../preview/PortScanner.ts";
 import { aivaCodexThreadParams } from "../../aiva/threadConfig.ts";
+import { aivaVoice, aivaVoiceAttach, type AivaVoiceClaim } from "../../aiva/voice.ts";
 import { getCodexServiceTierOptionValue } from "../../codexModelOptions.ts";
 import { ServerConfig } from "../../config.ts";
 import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
@@ -1551,7 +1552,9 @@ function isSensitiveCodexProtocolKey(key: string): boolean {
     normalized.endsWith("apikey") ||
     normalized.endsWith("token") ||
     normalized.endsWith("password") ||
-    normalized.endsWith("secret")
+    normalized.endsWith("secret") ||
+    // aiva P11: a realtime call's WebRTC offer and answer.
+    normalized === "sdp"
   );
 }
 
@@ -1741,6 +1744,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           settings: resolvedRuntime?.config ?? adapterOptions.settings,
           environment: resolvedRuntime?.environment ?? adapterOptions.environment,
         });
+        yield* aivaVoiceAttach(client);
         const additionalContextByThread = yield* Ref.make(
           new Map<
             string,
@@ -2049,6 +2053,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           const nativeThreadId = providerThread.nativeThreadRef?.nativeId;
           if (nativeThreadId == null) return;
           rootProviderThreads.set(nativeThreadId, providerThread);
+          if (providerThread.appThreadId !== null) {
+            aivaVoice.bindThread(providerThread.appThreadId, nativeThreadId, client.raw.request);
+          }
           yield* emitGoalUpdate(nativeThreadId);
         });
 
@@ -4660,6 +4667,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 );
               return;
             }
+            // A voice call's hand-off: t3 starts a run for it (startTurn adopts this turn).
+            if (yield* aivaVoice.turnStarted(payload.threadId, payload.turn.id)) return;
             yield* rememberSubagentTurnStarted({
               nativeThreadId: payload.threadId,
               nativeTurnId: payload.turn.id,
@@ -6836,6 +6845,25 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             ),
         );
 
+        // P11: a turn Codex started for a voice call becomes this run's turn.
+        const adoptVoiceTurn = Effect.fn("CodexAdapterV2.adoptVoiceTurn")(function* (
+          turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
+          claim: AivaVoiceClaim,
+        ) {
+          if (claim.type === "expired") {
+            return yield* completeGoalCommandTurn(
+              turnInput,
+              "Codex worked on this in the voice call, but its turn couldn't be shown here.",
+            );
+          }
+          yield* registerRootTurn({
+            turnInput,
+            nativeTurnId: claim.nativeTurnId,
+            startedAt: yield* DateTime.now,
+          });
+          yield* claim.done;
+        });
+
         /**
          * Setting or resuming a goal starts the first goal turn with this run's
          * turn configuration (approvals, sandbox, model, plan mode), since a
@@ -7229,6 +7257,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 ? parseGoalCommand(turnInput.message)
                 : null;
             if (goalCommand !== null) return runGoalCommand(turnInput, goalCommand);
+            const voiceTurn = aivaVoice.claimAdoption(turnInput.message.messageId);
+            if (voiceTurn !== null) return adoptVoiceTurn(turnInput, voiceTurn);
             return Effect.gen(function* () {
               yield* startNativeTurn(
                 turnInput,
