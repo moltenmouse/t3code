@@ -15,7 +15,29 @@ const runtimeVersionPolicy =
   (APP_VARIANT === "development" ? "appVersion" : "fingerprint");
 
 const personalTeamBundleIdentifier = repoEnv.T3CODE_IOS_PERSONAL_TEAM_BUNDLE_ID?.trim();
+// Aiva (fork): the iPhone app published under old Aiva's App Store identity (TestFlight workflow
+// aiva-ios-testflight.yml in moltenmouse/aiva-core). Its App IDs have App Groups and Push only, and the t3 domains and
+// Clerk's Sign in with Apple belong to t3's team, so those entitlements are left out.
+const aivaIos =
+  repoEnv.AIVA_IOS_IDENTITY === "1"
+    ? {
+        appName: "Aiva",
+        bundleIdentifier: "app.aivacode.moltenmouse",
+        shareExtensionBundleIdentifier: "app.aivacode.moltenmouse.share",
+        teamId: "8273XQ7764",
+        // The widgets extension needs its own App Store profile; AIVA_IOS_WIDGETS=0 builds without it.
+        widgets: repoEnv.AIVA_IOS_WIDGETS !== "0",
+      }
+    : null;
+const iosBuildNumber = repoEnv.AIVA_IOS_BUILD_NUMBER?.trim() || undefined;
 const IOS_BUNDLE_IDENTIFIER_PATTERN = /^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/;
+
+if (aivaIos && isIosPersonalTeamBuild) {
+  throw new Error("AIVA_IOS_IDENTITY and T3CODE_IOS_PERSONAL_TEAM cannot be combined.");
+}
+if (iosBuildNumber !== undefined && !/^[1-9][0-9]*$/.test(iosBuildNumber)) {
+  throw new Error("AIVA_IOS_BUILD_NUMBER must be a positive integer.");
+}
 
 // Compiled into the native project. Without a relay, Observe's native side could dispatch to
 // Expo's own ingest before observe.ts turns it off; `.invalid` never resolves (RFC 6761).
@@ -118,9 +140,11 @@ function resolveAppVariant(value: string | undefined): AppVariant {
 const variant = VARIANT_CONFIG[APP_VARIANT];
 // Copied thread links open the app. app.t3.codes/.well-known lists every variant's identifiers.
 const HOSTED_APP_HOST = "app.t3.codes";
-const iosBundleIdentifier = isIosPersonalTeamBuild
-  ? personalTeamBundleIdentifier!
-  : variant.iosBundleIdentifier;
+const iosBundleIdentifier = aivaIos
+  ? aivaIos.bundleIdentifier
+  : isIosPersonalTeamBuild
+    ? personalTeamBundleIdentifier!
+    : variant.iosBundleIdentifier;
 
 const dmSansFonts = {
   regular: "@expo-google-fonts/dm-sans/400Regular/DMSans_400Regular.ttf",
@@ -205,7 +229,8 @@ const sharingPlugin: NonNullable<ExpoConfig["plugins"]>[number] = [
     ios: {
       // Personal Teams cannot sign App Groups or extension targets; keep local builds usable.
       enabled: !isIosPersonalTeamBuild,
-      extensionBundleIdentifier: `${iosBundleIdentifier}.sharing`,
+      extensionBundleIdentifier:
+        aivaIos?.shareExtensionBundleIdentifier ?? `${iosBundleIdentifier}.sharing`,
       appGroupId: `group.${iosBundleIdentifier}`,
       activationRule: {
         supportsText: true,
@@ -226,7 +251,7 @@ const sharingPlugin: NonNullable<ExpoConfig["plugins"]>[number] = [
 // Match iOS PostScript names on Android so RN and the native composer share fonts before runtime loading.
 
 const config: ExpoConfig = {
-  name: variant.appName,
+  name: aivaIos?.appName ?? variant.appName,
   slug: "t3-code",
   platforms: ["ios", "android"],
   scheme: variant.scheme,
@@ -239,7 +264,8 @@ const config: ExpoConfig = {
   icon: variant.assets.appIcon,
   userInterfaceStyle: "automatic",
   updates: {
-    enabled: repoEnv.T3CODE_MOBILE_UPDATES_ENABLED !== "0",
+    // An Aiva-signed binary must never take t3's EAS updates.
+    enabled: !aivaIos && repoEnv.T3CODE_MOBILE_UPDATES_ENABLED !== "0",
     url: "https://u.expo.dev/d763fcb8-d37c-41ea-a773-b54a0ab4a454",
     checkAutomatically: "ON_LOAD",
     fallbackToCacheTimeout: 0,
@@ -249,15 +275,22 @@ const config: ExpoConfig = {
     supportsTablet: true,
     requireFullScreen: process.env.T3_SHOWCASE_CAPTURE_BUILD === "1",
     bundleIdentifier: iosBundleIdentifier,
+    ...(iosBuildNumber ? { buildNumber: iosBuildNumber } : {}),
     // Avoid Personal Team fallback: it cannot sign App Groups, Apple sign-in or push entitlements.
-    appleTeamId: "ARK85ZXQ4Z",
-    associatedDomains: [
-      `applinks:${variant.relyingParty}`,
-      `webcredentials:${variant.relyingParty}`,
-      `applinks:${HOSTED_APP_HOST}`,
-    ],
+    appleTeamId: aivaIos?.teamId ?? "ARK85ZXQ4Z",
+    ...(aivaIos
+      ? {}
+      : {
+          associatedDomains: [
+            `applinks:${variant.relyingParty}`,
+            `webcredentials:${variant.relyingParty}`,
+            `applinks:${HOSTED_APP_HOST}`,
+          ],
+        }),
     entitlements: {
-      "keychain-access-groups": [`$(AppIdentifierPrefix)${variant.iosBundleIdentifier}`],
+      "keychain-access-groups": [
+        `$(AppIdentifierPrefix)${aivaIos?.bundleIdentifier ?? variant.iosBundleIdentifier}`,
+      ],
     },
     infoPlist: {
       UISupportedInterfaceOrientations: [
@@ -358,7 +391,10 @@ const config: ExpoConfig = {
       },
     ],
     // Gate Clerk here: withoutIosPersonalTeamCapabilities runs too early to strip its entitlement.
-    ["@clerk/expo", { theme: "./clerk-theme.json", appleSignIn: !isIosPersonalTeamBuild }],
+    [
+      "@clerk/expo",
+      { theme: "./clerk-theme.json", appleSignIn: !isIosPersonalTeamBuild && !aivaIos },
+    ],
     "expo-web-browser",
     [
       "expo-quick-actions",
@@ -444,7 +480,9 @@ const config: ExpoConfig = {
     // Compile out the unused pedometer to avoid an iOS motion purpose string.
     ["expo-sensors", { motionPermission: false }],
     // Mods run in reverse order; expo-widgets must create and wipe the target before assets are added.
-    ...(!isIosPersonalTeamBuild ? ["./plugins/withWidgetLogoAsset.cjs", widgetsPlugin] : []),
+    ...(!isIosPersonalTeamBuild && aivaIos?.widgets !== false
+      ? ["./plugins/withWidgetLogoAsset.cjs", widgetsPlugin]
+      : []),
     "./plugins/withAndroidNetworkSecurityConfig.cjs",
     "./plugins/withAndroidGradleHeap.cjs",
     "./plugins/withAndroidInputBackground.cjs",
