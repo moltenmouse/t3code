@@ -3,6 +3,7 @@
  * thread's Codex config and Claude query options: extra MCP servers, hidden t3 tools, native
  * sub-agents off unless allowed, extra command env. Without settings, input is returned unchanged.
  */
+import { aivaOAuthTokenOption } from "./oauthToken.ts";
 import {
   type AivaSettings,
   fillThreadTemplate,
@@ -190,5 +191,6 @@ export function aivaClaudeQueryOptions<O extends ClaudeQueryOptionsFields>(
           ),
         }),
     ...(native && Object.keys(threadEnv).length === 0 ? {} : { env }),
+    ...aivaOAuthTokenOption(env),
   };
 }
