@@ -2549,6 +2549,13 @@ const make = Effect.gen(function* () {
           ? undefined
           : PeerForwarding.remoteTarget(callerScope, input.target.environmentId);
       if (input.target !== undefined && environmentId !== undefined) {
+        // Aiva P8: a fork carries this session's history, which only exists here.
+        if (input.forkContext === true) {
+          return yield* failure(
+            "invalid_request",
+            "forkContext continues this session's conversation, so the child runs in this environment. Omit target.environmentId, or omit forkContext.",
+          );
+        }
         yield* requireCapability(callerScope);
         const scope = yield* requireThreadScope(callerScope, "delegate_task");
         // The task's child runs as an ordinary thread there; this thread keeps the task.
@@ -2645,6 +2652,7 @@ const make = Effect.gen(function* () {
       // provider instance. A different agent/model cannot read that session.
       if (
         input.forkContext === true &&
+        !isRetryOfAcceptedDelegation &&
         target.modelSelection.instanceId !== parentRun.providerInstanceId
       ) {
         return yield* failure(
