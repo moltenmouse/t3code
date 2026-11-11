@@ -1,23 +1,13 @@
 // @effect-diagnostics nodeBuiltinImport:off -- git and option files, from a pure builder.
 /**
- * P5: options for a delegated child's worktree that `delegate_task` doesn't
- * take, passed by the Aiva sidecar beside the call instead of in it (so no
- * contract changes): `<aiva.json's folder>/aiva-delegations/<clientRequestId>.json`.
- *
- * - `includeUncommitted`: the child starts from the parent's working tree,
- *   uncommitted and untracked (non-ignored) files included. They're captured as
- *   a snapshot commit on top of the parent's HEAD, built with a throwaway index,
- *   so the parent's checkout, index and branch are untouched.
- * - `branch`: the child's branch name, instead of t3's generated one.
- *
- * Without a file, the strategy is returned unchanged. With one, the commit the
- * child starts from is written to `<clientRequestId>.result.json`, so the
- * sidecar can later diff exactly the child's own changes.
+ * P5: worktree options for a delegated child, read from `<aiva.json's folder>/aiva-delegations/
+ * <clientRequestId>.json` (no contract change): `includeUncommitted` snapshots the parent's work
+ * with a throwaway index, `branch` names the child's branch. The start commit goes to `.result.json`.
  */
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import * as NodeChildProcess from "node:child_process";
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 
 import { aivaSettingsPath } from "./settings.ts";
 
@@ -31,8 +21,8 @@ export interface AivaDelegationOptions {
 const CLIENT_REQUEST_ID = /^[A-Za-z0-9_.:-]{1,200}$/;
 const BRANCH = /^(?!-)(?!.*\.\.)(?!.*\/\/)[A-Za-z0-9._/-]{1,200}(?<!\.lock)(?<![./])$/;
 
-export function aivaDelegationsDir(): string {
-  return join(dirname(aivaSettingsPath()), "aiva-delegations");
+function aivaDelegationsDir(): string {
+  return NodePath.join(NodePath.dirname(aivaSettingsPath()), "aiva-delegations");
 }
 
 /** Reads and removes the options for one request. */
@@ -41,14 +31,14 @@ export function takeAivaDelegationOptions(
   dir: string = aivaDelegationsDir(),
 ): AivaDelegationOptions | null {
   if (clientRequestId === undefined || !CLIENT_REQUEST_ID.test(clientRequestId)) return null;
-  const path = join(dir, `${clientRequestId}.json`);
+  const path = NodePath.join(dir, `${clientRequestId}.json`);
   let raw: unknown;
   try {
-    raw = JSON.parse(readFileSync(path, "utf8"));
+    raw = JSON.parse(NodeFS.readFileSync(path, "utf8"));
   } catch {
     return null;
   }
-  rmSync(path, { force: true });
+  NodeFS.rmSync(path, { force: true });
   const input = typeof raw === "object" && raw !== null ? (raw as Record<string, unknown>) : {};
   return {
     includeUncommitted: input.includeUncommitted === true,
@@ -61,7 +51,7 @@ export function takeAivaDelegationOptions(
 }
 
 const git = (cwd: string, args: ReadonlyArray<string>, env?: NodeJS.ProcessEnv): string =>
-  execFileSync("git", args, {
+  NodeChildProcess.execFileSync("git", args, {
     cwd,
     env: { ...process.env, ...env },
     encoding: "utf8",
@@ -73,9 +63,9 @@ const git = (cwd: string, args: ReadonlyArray<string>, env?: NodeJS.ProcessEnv):
  * non-ignored files) on top of `baseCommit`, or `baseCommit` when nothing differs.
  */
 export function snapshotWorkingTree(cwd: string, baseCommit: string): string {
-  const scratch = mkdtempSync(join(tmpdir(), "aiva-snapshot-"));
+  const scratch = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "aiva-snapshot-"));
   try {
-    const env = { GIT_INDEX_FILE: join(scratch, "index") };
+    const env = { GIT_INDEX_FILE: NodePath.join(scratch, "index") };
     git(cwd, ["read-tree", baseCommit], env);
     git(cwd, ["add", "--all", "--", "."], env);
     const tree = git(cwd, ["write-tree"], env);
@@ -91,7 +81,7 @@ export function snapshotWorkingTree(cwd: string, baseCommit: string): string {
       },
     );
   } finally {
-    rmSync(scratch, { recursive: true, force: true });
+    NodeFS.rmSync(scratch, { recursive: true, force: true });
   }
 }
 
@@ -110,8 +100,8 @@ export function aivaDelegationWorkspace<
     ? snapshotWorkingTree(parentCwd, strategy.baseRef)
     : strategy.baseRef;
   try {
-    writeFileSync(
-      join(dir ?? aivaDelegationsDir(), `${clientRequestId}.result.json`),
+    NodeFS.writeFileSync(
+      NodePath.join(dir ?? aivaDelegationsDir(), `${clientRequestId}.result.json`),
       JSON.stringify({ baseRef, branch: options.branch }),
     );
   } catch {

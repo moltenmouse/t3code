@@ -1,8 +1,8 @@
 // @effect-diagnostics nodeBuiltinImport:off -- tests write settings files directly.
-import { createHmac } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import * as NodeCrypto from "node:crypto";
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 import { afterAll, describe, expect, it } from "vite-plus/test";
 
 import { aivaSettingsPath, loadAivaSettings, parseAivaSettings } from "./settings.ts";
@@ -23,7 +23,8 @@ const settings = parseAivaSettings({
   threadTokenSecret: SECRET,
   nativeSubagentThreads: ["thread-native"],
 });
-const token = (threadId: string) => createHmac("sha256", SECRET).update(threadId).digest("hex");
+const token = (threadId: string) =>
+  NodeCrypto.createHmac("sha256", SECRET).update(threadId).digest("hex");
 
 const codexParams = (): { cwd: string; config: Record<string, unknown> } => ({
   cwd: "/work",
@@ -209,8 +210,8 @@ describe("aivaClaudeQueryOptions", () => {
 });
 
 describe("loadAivaSettings", () => {
-  const dir = mkdtempSync(join(tmpdir(), "aiva-settings-"));
-  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+  const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "aiva-settings-"));
+  afterAll(() => NodeFS.rmSync(dir, { recursive: true, force: true }));
 
   it("finds the file under T3CODE_HOME unless named explicitly", () => {
     expect(aivaSettingsPath({ T3CODE_HOME: "/x/.t3" })).toBe("/x/.t3/aiva.json");
@@ -220,13 +221,13 @@ describe("loadAivaSettings", () => {
   });
 
   it("returns null without a file or for a broken one, and re-reads a changed file", () => {
-    const path = join(dir, "aiva.json");
+    const path = NodePath.join(dir, "aiva.json");
     expect(loadAivaSettings(path)).toBeNull();
-    writeFileSync(path, "{ not json");
+    NodeFS.writeFileSync(path, "{ not json");
     expect(loadAivaSettings(path)).toBeNull();
-    writeFileSync(path, JSON.stringify({ disabledTools: ["t3_thread_send"] }));
+    NodeFS.writeFileSync(path, JSON.stringify({ disabledTools: ["t3_thread_send"] }));
     expect(loadAivaSettings(path)?.disabledTools).toEqual(["t3_thread_send"]);
-    writeFileSync(path, JSON.stringify({ disabledTools: ["delegate_task", "task_status"] }));
+    NodeFS.writeFileSync(path, JSON.stringify({ disabledTools: ["delegate_task", "task_status"] }));
     expect(loadAivaSettings(path)?.disabledTools).toEqual(["delegate_task", "task_status"]);
   });
 });

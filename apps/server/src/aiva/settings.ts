@@ -6,10 +6,10 @@
  *
  * No file means no change: the fork then behaves exactly like upstream.
  */
-import { createHmac } from "node:crypto";
-import { readFileSync, statSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import * as NodeCrypto from "node:crypto";
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 
 export interface AivaMcpServer {
   /** May contain `{threadId}` and `{threadToken}`. */
@@ -51,8 +51,8 @@ const RESERVED_SERVERS = new Set(["t3-code", "t3-code-direct"]);
 export function aivaSettingsPath(env: NodeJS.ProcessEnv = process.env): string {
   const explicit = env.T3CODE_AIVA_SETTINGS?.trim();
   if (explicit) return explicit;
-  const base = env.T3CODE_HOME?.trim() || join(homedir(), ".t3");
-  return join(base, "aiva.json");
+  const base = env.T3CODE_HOME?.trim() || NodePath.join(NodeOS.homedir(), ".t3");
+  return NodePath.join(base, "aiva.json");
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -119,7 +119,7 @@ let cached: {
 export function loadAivaSettings(path: string = aivaSettingsPath()): AivaSettings | null {
   let stamp: string;
   try {
-    const stat = statSync(path);
+    const stat = NodeFS.statSync(path);
     stamp = `${stat.mtimeMs}:${stat.size}`;
   } catch {
     cached = { path, stamp: "", settings: null };
@@ -128,7 +128,7 @@ export function loadAivaSettings(path: string = aivaSettingsPath()): AivaSetting
   if (cached !== null && cached.path === path && cached.stamp === stamp) return cached.settings;
   let settings: AivaSettings | null;
   try {
-    settings = parseAivaSettings(JSON.parse(readFileSync(path, "utf8")));
+    settings = parseAivaSettings(JSON.parse(NodeFS.readFileSync(path, "utf8")));
   } catch (error) {
     // @effect-diagnostics-next-line globalConsole:off -- read from pure builders, outside any Effect.
     console.warn(
@@ -144,10 +144,10 @@ export function nativeSubagentsAllowed(settings: AivaSettings, threadId: string)
   return settings.nativeSubagents || settings.nativeSubagentThreads.includes(threadId);
 }
 
-export function threadToken(settings: AivaSettings, threadId: string): string | null {
+function threadToken(settings: AivaSettings, threadId: string): string | null {
   return settings.threadTokenSecret === null
     ? null
-    : createHmac("sha256", settings.threadTokenSecret).update(threadId).digest("hex");
+    : NodeCrypto.createHmac("sha256", settings.threadTokenSecret).update(threadId).digest("hex");
 }
 
 /**
