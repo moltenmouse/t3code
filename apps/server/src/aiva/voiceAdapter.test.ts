@@ -173,7 +173,9 @@ const transcript = (
       reasoningEffort: "medium",
     }),
     // A typed first turn, so the thread is known.
-    out(3, "turn/start", {
+    out(3, "config/read", { cwd: "/workspace", includeLayers: false }),
+    reply(3, { config: {}, origins: {} }),
+    out(4, "turn/start", {
       threadId: NATIVE_THREAD,
       input: [{ type: "text", text: "hello" }],
       cwd: "/workspace",
@@ -181,24 +183,26 @@ const transcript = (
       approvalPolicy: "never",
       approvalsReviewer: "user",
       sandboxPolicy: { type: "dangerFullAccess" },
-      summary: "detailed",
+      summary: "auto",
       collaborationMode: { mode: "default", settings: { model: "gpt-5.4" } },
     }),
-    reply(3, { turn: turn("typed-turn", "inProgress") }),
+    reply(4, { turn: turn("typed-turn", "inProgress") }),
     notify("turn/started", { threadId: NATIVE_THREAD, turn: turn("typed-turn", "inProgress") }),
     ...agentMessage("typed-turn", "typed-answer", "Hi."),
     notify("turn/completed", { threadId: NATIVE_THREAD, turn: turn("typed-turn", "completed") }),
     // The call: the thread's settings as they are now go on first, then the call.
-    out(4, "thread/settings/update", callSettings),
-    reply(4, {}),
-    out(5, "thread/realtime/start", {
+    out(5, "config/read", { cwd: CALL_POLICY.cwd, includeLayers: false }),
+    reply(5, { config: {}, origins: {} }),
+    out(6, "thread/settings/update", callSettings),
+    reply(6, {}),
+    out(7, "thread/realtime/start", {
       threadId: NATIVE_THREAD,
       outputModality: "audio",
       version: "v3",
       includeStartupContext: true,
       transport: { type: "webrtc", sdp: "offer" },
     }),
-    reply(5, {}),
+    reply(7, {}),
     notify("thread/realtime/sdp", { threadId: NATIVE_THREAD, sdp: "answer" }),
     notify("thread/realtime/started", {
       threadId: NATIVE_THREAD,
@@ -432,7 +436,6 @@ describe("voice turns in the Codex adapter (P11)", () => {
       };
       const log = CodexAdapterV2.makeCodexAppServerProtocolLogger({
         nativeEventLogger: logger,
-        threadId: THREAD_ID,
         providerSessionId: ProviderSessionId.make("provider-session-log"),
       });
       if (log === undefined) return assert.fail("no protocol logger");

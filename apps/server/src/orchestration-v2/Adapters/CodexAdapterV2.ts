@@ -2290,23 +2290,36 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               providerThread.appThreadId,
               nativeThreadId,
               client.raw.request,
-              (settings) =>
-                buildCodexTurnStartParams({
-                  nativeThreadId,
-                  codexInput: [],
-                  runtimePolicy:
-                    settings.runtimePolicy as ProviderAdapter.ProviderAdapterV2RuntimePolicy,
-                  modelSelection: settings.modelSelection as ModelSelection,
-                  omitServiceTier: adapterOptions.resolveRuntime !== undefined,
-                }).pipe(
-                  Effect.flatMap((params) =>
-                    client.raw.request(
-                      "thread/settings/update",
-                      aivaThreadSettingsUpdate(nativeThreadId, params),
+              (settings) => {
+                const runtimePolicy =
+                  settings.runtimePolicy as ProviderAdapter.ProviderAdapterV2RuntimePolicy;
+                // As startNativeTurn: the user's reasoning summary, else `auto`.
+                return client
+                  .request("config/read", { cwd: runtimePolicy.cwd, includeLayers: false })
+                  .pipe(
+                    Effect.map((response) => response.config.model_reasoning_summary ?? undefined),
+                    Effect.orElseSucceed(() => undefined),
+                    Effect.flatMap((configuredReasoningSummary) =>
+                      buildCodexTurnStartParams({
+                        nativeThreadId,
+                        codexInput: [],
+                        runtimePolicy,
+                        modelSelection: settings.modelSelection as ModelSelection,
+                        omitServiceTier: adapterOptions.resolveRuntime !== undefined,
+                        ...(configuredReasoningSummary === undefined
+                          ? {}
+                          : { configuredReasoningSummary }),
+                      }),
                     ),
-                  ),
-                  Effect.asVoid,
-                ),
+                    Effect.flatMap((params) =>
+                      client.raw.request(
+                        "thread/settings/update",
+                        aivaThreadSettingsUpdate(nativeThreadId, params),
+                      ),
+                    ),
+                    Effect.asVoid,
+                  );
+              },
             );
           }
         };
@@ -7916,9 +7929,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 : null;
             if (goalCommand !== null) return runGoalCommand(turnInput, goalCommand);
             const nativeThreadId = turnInput.providerThread.nativeThreadRef?.nativeId;
-            const voiceTurn = aivaVoice.claimAdoption(turnInput.message.messageId);
-            if (voiceTurn !== null) return adoptVoiceTurn(turnInput, voiceTurn);
             return Effect.gen(function* () {
+              const voiceTurn = aivaVoice.claimAdoption(turnInput.message.messageId);
+              if (voiceTurn !== null) return yield* adoptVoiceTurn(turnInput, voiceTurn);
               if (
                 turnInput.restartContinuationOfRunId === undefined &&
                 nativeThreadId != null &&
