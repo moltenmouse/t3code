@@ -48,8 +48,8 @@ env:
       sudo timeout 150 apt-get "${opts[@]}" install -y "$@"
     }
     resolves() { getent hosts "$1" >/dev/null; }
-    # The runner's own mirror: the first host in its apt sources.
-    own="$(grep -hoE 'https?://[^/ ]+' $sources 2>/dev/null | head -n 1 | sed -E 's#https?://##' || true)"
+    # The runner's own mirror: the first host its apt sources name (`URIs:` or `deb` lines, not comments).
+    own="$(grep -hE '^[[:space:]]*(URIs:|deb[[:space:]])' $sources 2>/dev/null | grep -oE 'https?://[^/ ]+' | head -n 1 | sed -E 's#https?://##' || true)"
     if [ -n "$own" ] && resolves "$own"; then
       try "$@" && exit 0
       echo "::warning::$* didn't install from $own; trying other mirrors"
