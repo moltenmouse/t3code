@@ -1,7 +1,9 @@
-# Builds and publishes an Aiva release of t3: Linux CLI archives (x64, arm64),
-# SHA256SUMS and the update feed files, as a GitHub release v<version>.
-# Mirrors the Linux CLI path of upstream's release.yml / release-desktop.yml,
-# without desktop, mobile, npm or signing.
+# Builds and publishes an Aiva release of t3: CLI archives for Linux (x64,
+# arm64) and macOS (Apple silicon), SHA256SUMS and the update feed files, as a
+# GitHub release v<version>. Mirrors the CLI path of upstream's release.yml /
+# release-desktop.yml, without desktop, mobile, npm or a signing certificate:
+# the macOS build is signed ad hoc, as upstream's is without one. No Intel
+# macOS build: Node can't make t3's single executable there (see release.yml).
 name: aiva-release
 
 on:
@@ -93,21 +95,28 @@ jobs:
           retention-days: 1
 
   cli:
-    name: CLI archive (linux-${{ matrix.arch }})
+    name: CLI archive (${{ matrix.resource_key }})
     needs: [version, bundle]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: true
       matrix:
         include:
-          - arch: x64
+          - platform: linux
+            arch: x64
             runner: ubuntu-24.04
             rust_target: x86_64-unknown-linux-gnu
             resource_key: linux-x64
-          - arch: arm64
+          - platform: linux
+            arch: arm64
             runner: ubuntu-24.04-arm
             rust_target: aarch64-unknown-linux-gnu
             resource_key: linux-arm64
+          - platform: mac
+            arch: arm64
+            runner: macos-15
+            rust_target: aarch64-apple-darwin
+            resource_key: darwin-arm64
     steps:
       - uses: actions/checkout@v6
         with:
@@ -136,6 +145,7 @@ jobs:
           mkdir -p "$dir"
           cp "native/resource-monitor/target/${{ matrix.rust_target }}/release/t3-resource-monitor" "$dir/t3-resource-monitor"
       - name: Install patchelf
+        if: matrix.platform == 'linux'
         run: command -v patchelf || { sudo apt-get update && sudo apt-get install -y patchelf; }
       - name: Apply web client branding
         run: node scripts/apply-web-brand-assets.ts production apps/server/dist/client
@@ -146,7 +156,7 @@ jobs:
       - name: Build CLI archive
         run: |
           node scripts/build-cli-archive.ts \
-            --platform linux \
+            --platform ${{ matrix.platform }} \
             --arch "${{ matrix.arch }}" \
             --version "${{ needs.version.outputs.version }}" \
             --resource-monitor-dir "$RUNNER_TEMP/cli-resource-monitor" \
@@ -156,7 +166,7 @@ jobs:
       - name: Upload CLI archive
         uses: actions/upload-artifact@v7
         with:
-          name: cli-linux-${{ matrix.arch }}
+          name: cli-${{ matrix.resource_key }}
           path: release-cli/*
           if-no-files-found: error
           retention-days: 7
@@ -169,7 +179,7 @@ jobs:
       - name: Download CLI archives
         uses: actions/download-artifact@v8
         with:
-          pattern: cli-linux-*
+          pattern: cli-*
           path: dist
           merge-multiple: true
       - name: Checksums and update feed files
@@ -181,9 +191,9 @@ jobs:
           ls -la
           sha256sum t3-*.tar.gz > SHA256SUMS
           date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          for pair in "x64:latest-linux.yml" "arm64:latest-linux-arm64.yml"; do
-            arch="${pair%%:*}"; feed="${pair#*:}"
-            archive="t3-${version}-linux-${arch}.tar.gz"
+          for pair in "linux-x64:latest-linux.yml" "linux-arm64:latest-linux-arm64.yml" "darwin-arm64:latest-mac.yml"; do
+            key="${pair%%:*}"; feed="${pair#*:}"
+            archive="t3-${version}-${key}.tar.gz"
             [ -f "$archive" ] || { echo "missing $archive" >&2; exit 1; }
             printf 'version: %s\npath: %s\nsha256: %s\nreleaseDate: %s\n' \
               "$version" "$archive" "$(sha256sum "$archive" | cut -d' ' -f1)" "$date" > "$feed"
