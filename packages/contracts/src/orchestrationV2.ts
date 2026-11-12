@@ -2916,6 +2916,9 @@ export const OrchestrationV2Command = Schema.Union([
     interactionMode: ProviderInteractionMode,
     branch: Schema.NullOr(TrimmedNonEmptyString),
     worktreePath: Schema.NullOr(TrimmedNonEmptyString),
+    // Aiva P13: a linked child of this thread, in the same project, made by a person or an app
+    // while the parent is idle (no task on a parent run, unlike delegated_task.request).
+    parentThreadId: Schema.optional(ThreadId),
     /** Only the server sets this; a client's thread.create never carries one. */
     linkOrigin: Schema.optional(OrchestrationV2LinkOrigin),
     /** Only the server sets this, with `linkOrigin`, for a linked environment's delegated task. */
