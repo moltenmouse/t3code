@@ -366,6 +366,8 @@ export const layer: Layer.Layer<
           .filter((transfer) => transfer.type === "subagent_result")
           .map((transfer) => transfer.id),
       );
+      // Aiva P16: runs up to a context reset belong to the forgotten conversation.
+      const resetBoundary = providerThread?.aivaContextResetAfterRunOrdinal ?? 0;
       const isPendingForRun = (handoff: OrchestrationV2ContextHandoff, anyProviderThread = false) =>
         handoff.status === "ready" &&
         (handoff.targetRunId === run.id ||
@@ -373,6 +375,7 @@ export const layer: Layer.Layer<
             projection.runs.some(
               (source) =>
                 source.id === handoff.targetRunId &&
+                source.ordinal > resetBoundary &&
                 (source.status === "failed" ||
                   source.status === "interrupted" ||
                   source.status === "cancelled" ||
@@ -1003,6 +1006,7 @@ export const layer: Layer.Layer<
           (source) =>
             !resumeFellBack &&
             source.ordinal < run.ordinal &&
+            source.ordinal > resetBoundary &&
             source.providerThreadId === providerThread.id &&
             (source.status === "failed" || source.status === "interrupted") &&
             !deliveredAttemptIds.has(source.activeAttemptId),
@@ -1089,14 +1093,20 @@ export const layer: Layer.Layer<
             toProviderThreadId: providerThread.id,
             fromProviderInstanceId: providerThread.providerInstanceId,
             toProviderInstanceId: run.providerInstanceId,
-            coveredRunOrdinals: { from: 1, to: Math.max(1, run.ordinal - 1) },
+            coveredRunOrdinals: {
+              from: resetBoundary + 1,
+              to: Math.max(resetBoundary + 1, run.ordinal - 1),
+            },
             strategy: "full_thread_summary",
             runs: projection.runs,
             items: (yield* projectionStore.getTurnStartHistory(input.threadId)).filter(
               (item) =>
-                item.runId === null ||
+                (item.runId === null && resetBoundary === 0) ||
                 projection.runs.some(
-                  (source) => source.id === item.runId && source.ordinal < run.ordinal,
+                  (source) =>
+                    source.id === item.runId &&
+                    source.ordinal < run.ordinal &&
+                    source.ordinal > resetBoundary,
                 ),
             ),
             createdAt,
@@ -1440,6 +1450,9 @@ export const layer: Layer.Layer<
         ownerNodeId: providerThread.ownerNodeId,
         firstRunOrdinal: providerThread.firstRunOrdinal ?? run.ordinal,
         lastRunOrdinal: run.ordinal,
+        ...(providerThread.aivaContextResetAfterRunOrdinal === undefined
+          ? {}
+          : { aivaContextResetAfterRunOrdinal: providerThread.aivaContextResetAfterRunOrdinal }),
         handoffIds:
           portableForkFallback === undefined
             ? providerThread.handoffIds

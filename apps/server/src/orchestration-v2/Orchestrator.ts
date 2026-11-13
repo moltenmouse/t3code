@@ -595,6 +595,7 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "thread.background-work.settle":
     case "thread.interrupt.unresponsive":
     case "thread.stop":
+    case "thread.context.reset":
     case "provider.switch":
       return command.threadId;
     case "delegated_task.request":
@@ -4317,6 +4318,120 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         },
       } satisfies PendingOrchestrationEffectV2;
       yield* Ref.update(effects, (existing) => [...existing, pendingEffect]);
+    },
+  );
+
+  /** Old Aiva's refusal while a turn runs (SessionContextResetService). */
+  const CONTEXT_RESET_BUSY =
+    "Session has an active turn. Wait for the turn to finish before resetting context.";
+
+  // Aiva P16: old Aiva's "Reset context" (a fresh agent session; same worktree, branch and machine). The thread's
+  // provider sessions detach and its active provider thread forgets its native thread, so the next turn calls
+  // ensureThread on that row instead of resuming the old conversation. The transcript stays.
+  const dispatchThreadContextReset = Effect.fn("orchestrationV2.dispatch.threadContextReset")(
+    function* (
+      command: Extract<OrchestrationV2Command, { readonly type: "thread.context.reset" }>,
+      events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+      effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
+    ) {
+      const reject = (cause: string) =>
+        new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause,
+        });
+      const projection = yield* projectionStore
+        .getThreadRecords(
+          command.threadId,
+          ["runs", "runtimeRequests", "providerThreads", "providerSessions"],
+          { turnItemTypes: [] },
+        )
+        .pipe(
+          Effect.mapError(
+            (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
+          ),
+        );
+      if (projection.thread.deletedAt !== null) {
+        return yield* reject(`Thread ${command.threadId} is deleted.`);
+      }
+      // A provider's own native sub-agent shares its parent's native session: there's nothing of its own to reset.
+      if (isProviderNativeSubagentThread(projection.thread)) {
+        return yield* new OrchestratorSubagentThreadReadOnlyError({
+          commandId: command.commandId,
+          threadId: command.threadId,
+        });
+      }
+      if (threadHasUnfinishedWork(projection)) return yield* reject(CONTEXT_RESET_BUSY);
+      const live = projection.providerSessions.filter(
+        (session) => session.status !== "stopped" && session.status !== "error",
+      );
+      for (const session of live) {
+        if (yield* sessionHasBackgroundWork(session, projection.providerThreads)) {
+          return yield* reject(
+            "The agent is still running background agents or commands, and a reset would end them. Wait for them to finish, or press Stop, then reset again.",
+          );
+        }
+      }
+      const active = projection.providerThreads.find(
+        (thread) => thread.id === projection.thread.activeProviderThreadId,
+      );
+      const now = yield* DateTime.now;
+      const reason = "Context reset.";
+      for (const session of live) {
+        yield* emit(
+          events,
+          command,
+        )({
+          type: "provider-session.detached",
+          threadId: command.threadId,
+          driver: session.driver,
+          providerInstanceId: session.providerInstanceId,
+          occurredAt: now,
+          payload: { providerSessionId: session.id, detachedAt: now, reason },
+        });
+        const pendingEffect = {
+          id: `effect:${command.commandId}:provider-session.detach:${session.id}`,
+          commandId: command.commandId,
+          threadId: command.threadId,
+          request: {
+            type: "provider-session.detach",
+            providerSessionId: session.id,
+            detail: reason,
+          },
+        } satisfies PendingOrchestrationEffectV2;
+        yield* Ref.update(effects, (existing) => [...existing, pendingEffect]);
+      }
+      // Nothing to forget (never ran, or already reset with no run since): the detach alone is the reset.
+      const lastRun = Math.max(0, ...projection.runs.map((run) => run.ordinal));
+      if (
+        active === undefined ||
+        (active.nativeThreadRef === null &&
+          (active.aivaContextResetAfterRunOrdinal ?? 0) >= lastRun)
+      )
+        return;
+      yield* emit(
+        events,
+        command,
+      )({
+        type: "provider-thread.updated",
+        threadId: command.threadId,
+        driver: active.driver,
+        providerInstanceId: active.providerInstanceId,
+        occurredAt: now,
+        payload: {
+          ...active,
+          nativeThreadRef: null,
+          nativeConversationHeadRef: null,
+          providerSessionId: null,
+          status: "not_loaded",
+          pendingBackgroundTasks: [],
+          contextUsage: null,
+          goal: null,
+          // Runs up to here belong to the forgotten conversation: no retry or handoff brings them back.
+          aivaContextResetAfterRunOrdinal: lastRun,
+          updatedAt: now,
+        },
+      });
     },
   );
 
@@ -13276,6 +13391,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       case "provider-session.detach":
         yield* dispatchProviderSessionDetach(command, events, effects);
         break;
+      case "thread.context.reset":
+        yield* dispatchThreadContextReset(command, events, effects);
+        break;
       case "thread.project.adopt-folder":
         yield* dispatchThreadProjectAdoptFolder(command, events);
         break;
@@ -13615,6 +13733,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           command.type === "thread.interrupt.unresponsive" ||
           command.type === "thread.stop" ||
           command.type === "subagent.stop" ||
+          // Aiva P16: a thread whose context is already fresh (never ran, or reset since) has nothing to reset.
+          command.type === "thread.context.reset" ||
           // Closing a share again, or after it ended, is not an error.
           command.type === "thread.guest-share.close" ||
           (command.type === "thread.delete" && command.onlyIfUnused === true),

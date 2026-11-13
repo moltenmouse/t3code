@@ -2321,7 +2321,22 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               break;
             }
             case "provider-thread.updated": {
-              const payloadJson = yield* encodeProviderThreadPayload(event.payload);
+              // Aiva P16: adapters send whole rows that may not carry the reset boundary; keep the stored one.
+              let providerThreadPayload = event.payload;
+              if (providerThreadPayload.aivaContextResetAfterRunOrdinal === undefined) {
+                const [stored] = yield* sql<{ readonly boundary: number | null }>`
+                  SELECT json_extract(payload_json, '$.aivaContextResetAfterRunOrdinal') AS boundary
+                  FROM orchestration_v2_projection_provider_threads
+                  WHERE provider_thread_id = ${providerThreadPayload.id}
+                `;
+                if (typeof stored?.boundary === "number") {
+                  providerThreadPayload = {
+                    ...providerThreadPayload,
+                    aivaContextResetAfterRunOrdinal: stored.boundary,
+                  };
+                }
+              }
+              const payloadJson = yield* encodeProviderThreadPayload(providerThreadPayload);
               const payload = parseEncodedPayload(payloadJson);
               yield* sql`
               INSERT INTO orchestration_v2_projection_provider_threads (
