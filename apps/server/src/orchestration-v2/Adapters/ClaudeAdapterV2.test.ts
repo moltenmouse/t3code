@@ -15784,8 +15784,9 @@ describe("ClaudeAdapterV2 background wake turns", () => {
   );
 
   // aiva P15: Claude Code never asks t3 for a renewed token, so the next turn after a renewal
-  // reopens a process that still holds the old (revoked) one.
-  it.effect("reopens a live process whose account token was renewed, with the new token", () =>
+  // reopens a process that still holds the old (revoked) one, however long it sat idle, and even
+  // with a background shell running (a process with a revoked token can't reach Claude at all).
+  const renewedTokenCase = (background: boolean) =>
     Effect.scoped(
       Effect.gen(function* () {
         const changes = yield* makeChangeSignal;
@@ -15872,7 +15873,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         );
         const now = yield* DateTime.now;
         const terminals = () => events.filter((event) => event.type === "turn.terminal").length;
-        const turn = (n: number, text: string) =>
+        const turn = (n: number, text: string, startsShell = false) =>
           Effect.gen(function* () {
             yield* runtime.startTurn(
               makeClaudeTestTurnInput({
@@ -15885,6 +15886,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
                 providerTurnOrdinal: n,
               }),
             );
+            if (startsShell) yield* Queue.offer(processQueues.at(-1)!, wakeTaskStarted);
             yield* Queue.offer(
               processQueues.at(-1)!,
               makeResultFrame({
@@ -15897,7 +15899,8 @@ describe("ClaudeAdapterV2 background wake turns", () => {
 
         yield* turn(1, "First.");
         // The same token next turn: the process is kept.
-        yield* turn(2, "Second.");
+        yield* turn(2, "Second.", background);
+        if (background) assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
         assert.deepEqual(openedTokens, ["token-1"]);
         // The sidecar renews the account (the old token is revoked) and rewrites the file.
         yield* fileSystem.writeFileString(tokenFile, "token-2");
@@ -15917,7 +15920,12 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           ),
         ),
       ),
-    ),
+    );
+  it.effect("reopens a live process whose account token was renewed, with the new token", () =>
+    renewedTokenCase(false),
+  );
+  it.effect("reopens a stale-token process even with a background shell running", () =>
+    renewedTokenCase(true),
   );
 
   const WORKFLOW_TASK_ID = "task-workflow-run";

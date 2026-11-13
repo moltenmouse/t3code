@@ -10408,12 +10408,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           const compiledSelection = compileClaudeModelSelection(turnInput.modelSelection);
           const resumeSessionAt = yield* getNativeConversationHeadId(turnInput.providerThread);
           const existing = yield* Ref.get(queryContext);
-          // P15: a process holding a token its account has since renewed is reopened with the new one.
+          // P15: a process holding a token its account has since renewed is reopened with the new one,
+          // even with background work: with a revoked token it can't reach Claude at all.
           const tokenStale =
-            existing !== null &&
-            !existing.stopping &&
-            aivaClaudeTokenStale(existing.query) &&
-            !(yield* liveProcessRunsBackgroundWork(existing));
+            existing !== null && !existing.stopping && aivaClaudeTokenStale(existing.query);
           // Continuations drain existing output without prompting; retain the live process regardless of selection.
           if (
             existing !== null &&
@@ -10487,6 +10485,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             (existing.nativeThreadId === nativeThreadId ||
               existing.lastTurn?.input.threadId === turnInput.threadId) &&
             !existing.stopping &&
+            !tokenStale &&
             (yield* liveProcessRunsBackgroundWork(existing))
           ) {
             return yield* new ClaudeBackgroundWorkBlocksQueryReplacementError();
