@@ -1,7 +1,7 @@
 /**
  * Per-thread agent configuration from `aiva.json` (see settings.ts), applied where t3 builds a
  * thread's Codex config and Claude query options: extra MCP servers, hidden t3 tools, native
- * sub-agents off unless allowed, extra command env. Without settings, input is returned unchanged.
+ * sub-agents off unless allowed, built-in agent tools switched off, extra command env. Without settings, input is returned unchanged.
  */
 import { aivaOAuthTokenOption } from "./oauthToken.ts";
 import {
@@ -16,6 +16,19 @@ const T3_DIRECT_SERVER = "t3-code-direct";
 const CODEX_MCP_TOOL_TIMEOUT_SEC = 600;
 const CLAUDE_MCP_TOOL_TIMEOUT_MS = 600_000;
 const CLAUDE_AGENT_TEAM_ENV = ["CLAUDE_CODE_TEAM_NAME", "CLAUDE_CODE_TASK_LIST_ID"];
+
+/**
+ * Codex built-in tools that `disabledNativeTools.codex` can switch off, and the config that does it.
+ * `request_user_input`: `tools.experimental_request_user_input.enabled` unregisters it in every
+ * collaboration mode (Codex 0.159); `features.default_mode_request_user_input` keeps it out of
+ * Default mode on older versions, which ignore the unknown `tools` key.
+ */
+const CODEX_NATIVE_TOOL_CONFIG: Readonly<Record<string, Readonly<Record<string, boolean>>>> = {
+  request_user_input: {
+    "tools.experimental_request_user_input.enabled": false,
+    "features.default_mode_request_user_input": false,
+  },
+};
 
 const union = (existing: unknown, extra: ReadonlyArray<string>): Array<string> =>
   Array.from(
@@ -111,6 +124,11 @@ export function aivaCodexThreadParams<
     config["features.multi_agent"] = false;
     config["features.multi_agent_v2"] = false;
   }
+  for (const tool of settings.disabledNativeTools.codex) {
+    if (Object.hasOwn(CODEX_NATIVE_TOOL_CONFIG, tool)) {
+      Object.assign(config, CODEX_NATIVE_TOOL_CONFIG[tool]);
+    }
+  }
   for (const server of resolvedServers(
     settings,
     threadId,
@@ -147,6 +165,7 @@ export function aivaClaudeQueryOptions<O extends ClaudeQueryOptionsFields>(
   const disallowed = [
     ...settings.disabledTools.map((tool) => `mcp__${T3_SERVER}__${tool}`),
     ...(native ? [] : ["Agent"]),
+    ...settings.disabledNativeTools.claude,
   ];
   const servers = resolvedServers(
     settings,

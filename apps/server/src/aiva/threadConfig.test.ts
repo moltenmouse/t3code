@@ -52,6 +52,21 @@ describe("parseAivaSettings", () => {
     ).toBeNull();
   });
 
+  it("reads built-in tools to switch off per provider, and none without the field", () => {
+    expect(
+      parseAivaSettings({
+        disabledNativeTools: {
+          claude: ["AskUserQuestion", "bad name!", 3],
+          codex: ["request_user_input"],
+        },
+      }).disabledNativeTools,
+    ).toEqual({ claude: ["AskUserQuestion"], codex: ["request_user_input"] });
+    expect(parseAivaSettings({}).disabledNativeTools).toEqual({ claude: [], codex: [] });
+    expect(
+      parseAivaSettings({ disabledNativeTools: ["AskUserQuestion"] }).disabledNativeTools,
+    ).toEqual({ claude: [], codex: [] });
+  });
+
   it("refuses a short token secret", () => {
     expect(parseAivaSettings({ threadTokenSecret: "short" }).threadTokenSecret).toBeNull();
   });
@@ -86,6 +101,23 @@ describe("aivaCodexThreadParams", () => {
       http_headers: { Authorization: `Bearer ${token("t1")}` },
     });
     expect(config["shell_environment_policy.set.TMPDIR"]).toBe("/home/u/ac/.scratch/t1");
+  });
+
+  it("switches off request_user_input when asked, and only then", () => {
+    const off = parseAivaSettings({
+      disabledNativeTools: {
+        claude: ["AskUserQuestion"],
+        codex: ["request_user_input", "unknown_tool"],
+      },
+    });
+    const { config } = aivaCodexThreadParams("t1", codexParams(), off);
+    expect(config["tools.experimental_request_user_input.enabled"]).toBe(false);
+    expect(config["features.default_mode_request_user_input"]).toBe(false);
+    expect(config["tools.update_plan.enabled"]).toBe(true);
+    expect(Object.keys(config).some((key) => key.includes("unknown_tool"))).toBe(false);
+    const on = aivaCodexThreadParams("t1", codexParams(), settings).config;
+    expect(on["tools.experimental_request_user_input.enabled"]).toBeUndefined();
+    expect(on["features.default_mode_request_user_input"]).toBeUndefined();
   });
 
   it("allows native sub-agents for a listed thread", () => {
@@ -199,6 +231,25 @@ describe("aivaClaudeQueryOptions", () => {
       TMPDIR: "/home/u/ac/.scratch/t1",
       CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: "0",
     });
+  });
+
+  it("disallows the built-in tools named for Claude", () => {
+    const off = parseAivaSettings({
+      disabledNativeTools: { claude: ["AskUserQuestion"], codex: ["request_user_input"] },
+      nativeSubagentThreads: ["thread-native"],
+    });
+    expect(aivaClaudeQueryOptions("t1", base(), off).disallowedTools).toEqual([
+      "WebSearch",
+      "Agent",
+      "AskUserQuestion",
+    ]);
+    expect(aivaClaudeQueryOptions("thread-native", base(), off).disallowedTools).toEqual([
+      "WebSearch",
+      "AskUserQuestion",
+    ]);
+    expect(aivaClaudeQueryOptions("t1", base(), settings).disallowedTools).not.toContain(
+      "AskUserQuestion",
+    );
   });
 
   it("keeps Agent and agent teams for a listed thread", () => {
