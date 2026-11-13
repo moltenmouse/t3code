@@ -3,7 +3,7 @@
  * thread's Codex config and Claude query options: extra MCP servers, hidden t3 tools, native
  * sub-agents off unless allowed, built-in agent tools switched off, extra command env. Without settings, input is returned unchanged.
  */
-import { aivaOAuthTokenOption } from "./oauthToken.ts";
+import { aivaOAuthTokenEnv, aivaOAuthTokenOption } from "./oauthToken.ts";
 import {
   type AivaSettings,
   fillThreadTemplate,
@@ -173,10 +173,13 @@ export function aivaClaudeQueryOptions<O extends ClaudeQueryOptionsFields>(
     t3McpVars(options.mcpServers?.[T3_SERVER], "headers"),
   );
   const threadEnv = resolvedEnv(settings, threadId);
-  const env: Record<string, string | undefined> = {
+  const baseEnv: Record<string, string | undefined> = {
     ...(options.env ?? process.env),
     ...threadEnv,
   };
+  // P15: the account's current token, not the settings' copy.
+  const env = aivaOAuthTokenEnv(baseEnv);
+  const tokenEnvChanged = env !== baseEnv;
   if (!native) {
     env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS = "0";
     for (const key of CLAUDE_AGENT_TEAM_ENV) delete env[key];
@@ -209,7 +212,7 @@ export function aivaClaudeQueryOptions<O extends ClaudeQueryOptionsFields>(
             servers.map((server) => `mcp__${server.name}__*`),
           ),
         }),
-    ...(native && Object.keys(threadEnv).length === 0 ? {} : { env }),
+    ...(native && Object.keys(threadEnv).length === 0 && !tokenEnvChanged ? {} : { env }),
     ...aivaOAuthTokenOption(env),
   };
 }

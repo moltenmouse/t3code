@@ -1,6 +1,11 @@
 import * as DocumentText from "../../provider/DocumentText.ts";
 import { aivaClaudeQueryOptions } from "../../aiva/threadConfig.ts";
 import { aivaFullAccessApproves } from "../../aiva/approvals.ts";
+import {
+  aivaClaudeInterruptRestart,
+  aivaClaudeTokenStale,
+  aivaRememberClaudeToken,
+} from "../../aiva/oauthToken.ts";
 import { makeProviderTextDeltaCoalescer } from "./ProviderTextDeltaCoalescer.ts";
 import { claudeTaskOutputRoot, tailClaudeTaskOutput } from "./ClaudeTaskOutputTail.ts";
 import {
@@ -406,7 +411,9 @@ export const ClaudeProviderCapabilitiesV2 = {
     supportsInterrupt: true,
     supportsActiveSteering: true,
     activeSteeringInterruptsTools: true,
-    supportsSteeringByInterruptRestart: false,
+    get supportsSteeringByInterruptRestart() {
+      return aivaClaudeInterruptRestart();
+    },
     supportsQueuedMessages: true,
     terminalStatusQuality: "strong",
   },
@@ -10401,6 +10408,12 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           const compiledSelection = compileClaudeModelSelection(turnInput.modelSelection);
           const resumeSessionAt = yield* getNativeConversationHeadId(turnInput.providerThread);
           const existing = yield* Ref.get(queryContext);
+          // P15: a process holding a token its account has since renewed is reopened with the new one.
+          const tokenStale =
+            existing !== null &&
+            !existing.stopping &&
+            aivaClaudeTokenStale(existing.query) &&
+            !(yield* liveProcessRunsBackgroundWork(existing));
           // Continuations drain existing output without prompting; retain the live process regardless of selection.
           if (
             existing !== null &&
@@ -10415,6 +10428,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             existing.nativeThreadId === nativeThreadId &&
             existing.queryPolicyKey === queryPolicyKey &&
             !existing.stopping &&
+            !tokenStale &&
             existing.selection.queryIdentity !== compiledSelection.queryIdentity &&
             canApplyClaudeSelectionLive(existing.selection, compiledSelection) &&
             (existing.selection.apiModelId === compiledSelection.apiModelId ||
@@ -10444,6 +10458,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             existing.nativeThreadId === nativeThreadId &&
             existing.queryPolicyKey === queryPolicyKey &&
             !existing.stopping &&
+            !tokenStale &&
             existing.selection.queryIdentity === compiledSelection.queryIdentity
           ) {
             // A denied ExitPlanMode leaves Claude in plan mode. Restore only from plan:
@@ -10562,6 +10577,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               options: queryOptions,
             })
             .pipe(
+              Effect.tap((opened) =>
+                Effect.sync(() => aivaRememberClaudeToken(opened, queryOptions.env)),
+              ),
               Effect.onError(() =>
                 closedExistingNativeThreadId === nativeThreadId
                   ? Effect.gen(function* () {

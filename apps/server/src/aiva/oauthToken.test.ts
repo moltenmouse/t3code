@@ -7,7 +7,15 @@ import * as ClaudeSdk from "@anthropic-ai/claude-agent-sdk";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { afterEach, describe, expect, it } from "@effect/vitest";
 
-import { aivaOAuthTokenOption, oauthTokenFromFile, TOKEN_FILE_ENV } from "./oauthToken.ts";
+import {
+  aivaClaudeTokenStale,
+  aivaCurrentOAuthToken,
+  aivaOAuthTokenEnv,
+  aivaOAuthTokenOption,
+  aivaRememberClaudeToken,
+  oauthTokenFromFile,
+  TOKEN_FILE_ENV,
+} from "./oauthToken.ts";
 import { parseAivaSettings } from "./settings.ts";
 import { aivaClaudeQueryOptions } from "./threadConfig.ts";
 
@@ -171,4 +179,95 @@ process.stdin.on("data", (chunk) => {
       }
     },
   );
+});
+
+// P15: Claude Code never asks for `getOAuthToken` when t3 runs it (its entrypoint isn't one of
+// Anthropic's apps), so t3 hands the renewed token over itself.
+describe("a renewed Claude login reaches the next turn", () => {
+  it("starts a Claude process with the token file's token, not the settings' copy", () => {
+    const file = NodePath.join(tempDir(), "claude-account-2");
+    NodeFS.writeFileSync(file, "token-new\n");
+    const settingsEnv: Record<string, string | undefined> = {
+      CLAUDE_CODE_OAUTH_TOKEN: "token-old",
+      [TOKEN_FILE_ENV]: file,
+      HOME: "/h",
+    };
+    const env = aivaOAuthTokenEnv(settingsEnv);
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe("token-new");
+    expect(env.HOME).toBe("/h");
+    // Claude Code waits on a refused token rather than failing the turn at once, so a turn running
+    // through a renewal can be restarted with the new one.
+    expect(env.CLAUDE_CODE_OAUTH_401_WAIT_MS).toBe("20000");
+    expect(
+      aivaOAuthTokenEnv({ [TOKEN_FILE_ENV]: file, CLAUDE_CODE_OAUTH_401_WAIT_MS: "5" })
+        .CLAUDE_CODE_OAUTH_401_WAIT_MS,
+    ).toBe("5");
+  });
+
+  it("keeps the settings' token when the file has none, and changes nothing without a file", () => {
+    const dir = tempDir();
+    const empty = NodePath.join(dir, "empty");
+    NodeFS.writeFileSync(empty, "");
+    expect(
+      aivaOAuthTokenEnv({ CLAUDE_CODE_OAUTH_TOKEN: "token-old", [TOKEN_FILE_ENV]: empty })
+        .CLAUDE_CODE_OAUTH_TOKEN,
+    ).toBe("token-old");
+    expect(aivaCurrentOAuthToken({ [TOKEN_FILE_ENV]: NodePath.join(dir, "missing") })).toBeNull();
+    const plain = { CLAUDE_CODE_OAUTH_TOKEN: "token-old" };
+    expect(aivaOAuthTokenEnv(plain)).toBe(plain);
+  });
+
+  it("tells a live process holding a replaced token from one that's current", () => {
+    const dir = tempDir();
+    const file = NodePath.join(dir, "claude-account-2");
+    NodeFS.writeFileSync(file, "token-1");
+    // Only with aiva.json: without it nothing is noted, as upstream.
+    const previous = process.env.T3CODE_AIVA_SETTINGS;
+    process.env.T3CODE_AIVA_SETTINGS = NodePath.join(dir, "missing-aiva.json");
+    const upstream = {};
+    aivaRememberClaudeToken(upstream, {
+      CLAUDE_CODE_OAUTH_TOKEN: "token-0",
+      [TOKEN_FILE_ENV]: file,
+    });
+    expect(aivaClaudeTokenStale(upstream)).toBe(false);
+    NodeFS.writeFileSync(NodePath.join(dir, "aiva.json"), "{}");
+    process.env.T3CODE_AIVA_SETTINGS = NodePath.join(dir, "aiva.json");
+    try {
+      staleness(file);
+    } finally {
+      if (previous === undefined) delete process.env.T3CODE_AIVA_SETTINGS;
+      else process.env.T3CODE_AIVA_SETTINGS = previous;
+    }
+  });
+
+  const staleness = (file: string) => {
+    const [first, second, unnamed] = [{}, {}, {}];
+    aivaRememberClaudeToken(first, { CLAUDE_CODE_OAUTH_TOKEN: "token-1", [TOKEN_FILE_ENV]: file });
+    aivaRememberClaudeToken(unnamed, { CLAUDE_CODE_OAUTH_TOKEN: "token-1" });
+    expect(aivaClaudeTokenStale(first)).toBe(false);
+    // The account is renewed: the process started before it is stale, one started after isn't.
+    NodeFS.writeFileSync(file, "token-2");
+    aivaRememberClaudeToken(second, { CLAUDE_CODE_OAUTH_TOKEN: "token-2", [TOKEN_FILE_ENV]: file });
+    expect(aivaClaudeTokenStale(first)).toBe(true);
+    expect(aivaClaudeTokenStale(second)).toBe(false);
+    // No token file named, or a process t3 never noted: never stale.
+    expect(aivaClaudeTokenStale(unnamed)).toBe(false);
+    expect(aivaClaudeTokenStale({})).toBe(false);
+    // A signed-out account (the sidecar removed the file) doesn't reopen anything.
+    NodeFS.rmSync(file);
+    expect(aivaClaudeTokenStale(first)).toBe(false);
+  };
+
+  it("gives every thread's query the current token, with aiva.json only", () => {
+    const file = NodePath.join(tempDir(), "claude-account-2");
+    NodeFS.writeFileSync(file, "token-new");
+    const env = { CLAUDE_CODE_OAUTH_TOKEN: "token-old", [TOKEN_FILE_ENV]: file };
+    // Native sub-agents allowed and no thread env: the env is still passed, for the token.
+    const settings = parseAivaSettings({ nativeSubagents: true });
+    const withAiva = aivaClaudeQueryOptions("thread-1", { env }, settings);
+    expect(withAiva.env?.CLAUDE_CODE_OAUTH_TOKEN).toBe("token-new");
+    expect(aivaClaudeQueryOptions("thread-1", { env }, null).env?.CLAUDE_CODE_OAUTH_TOKEN).toBe(
+      "token-old",
+    );
+  });
 });
