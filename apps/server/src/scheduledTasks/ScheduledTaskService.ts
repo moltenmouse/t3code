@@ -29,6 +29,7 @@ import {
   managedRuntimeModeDenial,
 } from "@t3tools/contracts";
 import { aivaWebhookBaseUrl } from "../aiva/settings.ts";
+import * as AivaTaskLimits from "../aiva/scheduledTaskLimits.ts";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Digest from "effect/crypto/Digest";
@@ -230,6 +231,7 @@ interface ScheduledTaskRow {
   readonly last_run_status: string;
   readonly last_run_error: string | null;
   readonly run_count: number;
+  readonly aiva_max_runs: number | null;
   readonly webhook_token: string | null;
   readonly webhook_secret: string | null;
 }
@@ -411,6 +413,7 @@ const decodeRow = Effect.fnUntraced(
       lastRunStatus: row.last_run_status,
       lastRunError: row.last_run_error,
       runCount: row.run_count,
+      maxRuns: row.aiva_max_runs,
       ...(webhook === undefined ? {} : { webhook }),
     });
   },
@@ -463,6 +466,7 @@ export const layer = Layer.effect(
   ScheduledTaskService,
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
+    yield* AivaTaskLimits.ensureScheduledTaskLimits(sql);
     const random = yield* SecureRandom.SecureRandom;
     const digest = yield* Digest.Digest;
     const mac = yield* Mac.Mac;
@@ -535,6 +539,7 @@ export const layer = Layer.effect(
         last_run_status,
         last_run_error,
         run_count,
+        aiva_max_runs,
         webhook_token,
         webhook_secret
       FROM scheduled_tasks
@@ -577,6 +582,7 @@ export const layer = Layer.effect(
         last_run_status,
         last_run_error,
         run_count,
+        aiva_max_runs,
         webhook_token,
         webhook_secret
       FROM scheduled_tasks
@@ -655,6 +661,7 @@ export const layer = Layer.effect(
           last_run_status,
           last_run_error,
           run_count,
+          aiva_max_runs,
           webhook_token,
           webhook_secret
         )
@@ -680,6 +687,7 @@ export const layer = Layer.effect(
           ${task.lastRunStatus},
           ${task.lastRunError},
           ${task.runCount},
+          ${task.maxRuns ?? null},
           ${webhook.token},
           ${webhook.secret}
         WHERE ${requireExisting ? 0 : 1} = 1
@@ -704,6 +712,7 @@ export const layer = Layer.effect(
           runtime_mode = excluded.runtime_mode,
           interaction_mode = excluded.interaction_mode,
           creation_source = excluded.creation_source,
+          aiva_max_runs = excluded.aiva_max_runs,
           updated_at = excluded.updated_at,
           -- Keep a next_run_at that a finishing run moved during this save, unless
           -- another edit changed the schedule or enabled state meanwhile.
@@ -994,6 +1003,27 @@ export const layer = Layer.effect(
           if (reason !== null) return yield* new WebhookDeliverySkipped({ reason });
         }
 
+        // P17: checked here, under this task's run reservation, so every trigger (scheduled, manual, webhook)
+        // stops at the limit even if an edit lowered it after the last counted run.
+        if (AivaTaskLimits.hasReachedMaxRuns(active)) {
+          if (webhook !== undefined) {
+            return yield* new WebhookDeliverySkipped({ reason: AivaTaskLimits.MAX_RUNS_REACHED });
+          }
+          if (trigger !== "scheduled") {
+            return yield* taskError(AivaTaskLimits.MAX_RUNS_REACHED, { taskId: active.id });
+          }
+          yield* AivaTaskLimits.pauseAtLimit(sql, active.id, iso(startedAt)).pipe(
+            Effect.mapError((cause) =>
+              taskError("Could not pause schedule task.", { taskId: active.id, cause }),
+            ),
+          );
+          yield* notifyChanged;
+          return {
+            task: { ...active, enabled: false, nextRunAt: null },
+            threadId: null,
+            dispatchFailed: false,
+          };
+        }
         if (webhook === undefined) yield* markRunning(active.id, startedAtIso);
         else
           yield* sql
@@ -1147,8 +1177,11 @@ export const layer = Layer.effect(
               if (counted.length > 0) written = yield* completion;
             }
           }
+          // P17: the write that counts the run can pause the task (its trigger), so report the row as stored.
+          const [after] = written ? yield* getRows(task.id) : [];
+          const stored = after === undefined ? completed : yield* decodeRow(after, origin);
           // A row recreated mid-run is not this run's, so report what is stored.
-          return { recorded: written ? completed : current, written };
+          return { recorded: written ? stored : current, written };
         });
         const { recorded, written } = yield* sql
           .withTransaction(record)
@@ -1547,9 +1580,16 @@ export const layer = Layer.effect(
         lastRunStatus: existingTask?.lastRunStatus ?? "never",
         lastRunError: existingTask?.lastRunError ?? null,
         runCount: existingTask?.runCount ?? 0,
+        maxRuns: AivaTaskLimits.maxRunsToStore(input.maxRuns, existingTask?.maxRuns),
       };
+      // P17: a task at its run limit isn't switched back on until the limit is raised or cleared;
+      // an edit of a running task that lowers its limit to its run count pauses it as it saves.
+      const atLimit = task.enabled && AivaTaskLimits.hasReachedMaxRuns(task);
+      if (atLimit && existingTask?.enabled !== true) {
+        return yield* taskError(AivaTaskLimits.MAX_RUNS_REACHED, { taskId: id });
+      }
       yield* saveTask(
-        task,
+        atLimit ? { ...task, enabled: false, nextRunAt: null } : task,
         input.requireExisting === true,
         scheduleUnchanged ? existingTask.schedule : null,
         webhook,
@@ -1563,6 +1603,10 @@ export const layer = Layer.effect(
     )(function* (input) {
       const existing = yield* loadTask(input.id);
       if (existing.enabled === input.enabled) return { task: existing };
+      // P17: a task at its run limit isn't switched back on until the limit is raised or cleared.
+      if (input.enabled && AivaTaskLimits.hasReachedMaxRuns(existing)) {
+        return yield* taskError(AivaTaskLimits.MAX_RUNS_REACHED, { taskId: input.id });
+      }
       if (
         input.enabled &&
         existing.schedule.type === "webhook" &&

@@ -1155,6 +1155,8 @@ export const OrchestrationV2ProviderThread = Schema.Struct({
   goal: Schema.optional(Schema.NullOr(OrchestrationV2ProviderGoal)).pipe(
     Schema.withDecodingDefault(Effect.succeed(null)),
   ),
+  /** Aiva P16: the last run ordinal before a context reset; retries and handoffs leave out runs up to it. */
+  aivaContextResetAfterRunOrdinal: Schema.optional(NonNegativeInt),
   createdAt: Schema.DateTimeUtc,
   updatedAt: Schema.DateTimeUtc,
 });
@@ -3055,6 +3057,15 @@ export const OrchestrationV2DomainEventJson = Schema.Union([
 export type OrchestrationV2DomainEventJson = typeof OrchestrationV2DomainEventJson.Type;
 
 export const OrchestrationV2Command = Schema.Union([
+  /**
+   * Aiva P16: start the thread's next turn in a fresh native provider session (old Aiva's "Reset context": a new
+   * runtime session id, same thread, worktree and branch). Refused while a run is active or queued or a request waits.
+   */
+  Schema.Struct({
+    type: Schema.Literal("thread.context.reset"),
+    commandId: CommandId,
+    threadId: ThreadId,
+  }),
   Schema.Struct({
     type: Schema.Literal("thread.stop"),
     commandId: CommandId,

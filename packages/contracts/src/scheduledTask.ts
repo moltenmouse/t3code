@@ -238,6 +238,12 @@ export function scheduledTaskThreadMode(
   return task.threadMode ?? (task.threadId === null ? "new_thread" : "continue");
 }
 
+/** Aiva (P17): a run limit, as old Aiva's loops had it (1 to 500, its MaxRunsCeiling). */
+export const ScheduledTaskMaxRuns = Schema.Int.check(
+  Schema.isGreaterThanOrEqualTo(1),
+  Schema.isLessThanOrEqualTo(500),
+);
+
 export const ScheduledTask = Schema.Struct({
   id: ScheduledTaskId,
   title: TrimmedNonEmptyString,
@@ -260,6 +266,8 @@ export const ScheduledTask = Schema.Struct({
   lastRunStatus: ScheduledTaskRunStatus,
   lastRunError: Schema.NullOr(Schema.String),
   runCount: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  /** Aiva (P17): pauses after this many runs; null for no limit. */
+  maxRuns: Schema.optional(Schema.NullOr(ScheduledTaskMaxRuns)),
   webhook: Schema.optional(ScheduledTaskWebhookEndpoint),
   /** Why the task cannot run regardless of `enabled`, such as a managed policy refusing webhooks. */
   blockedByPolicy: Schema.optionalKey(Schema.String),
@@ -296,6 +304,10 @@ export const ScheduledTaskUpsertInput = Schema.Struct({
   interactionMode: ProviderInteractionMode,
   createdBy: Schema.optional(OrchestrationV2Actor),
   creationSource: Schema.optional(OrchestrationV2CreationSource),
+  maxRuns: Schema.optional(Schema.NullOr(ScheduledTaskMaxRuns)).annotate({
+    description:
+      "Pause after this many runs (1 to 500). Null: no limit. Omit to keep the current limit.",
+  }),
 });
 export type ScheduledTaskUpsertInput = typeof ScheduledTaskUpsertInput.Type;
 
