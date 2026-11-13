@@ -221,6 +221,7 @@ import { acceptsPrivateNetworkConnection, loopbackUrlHostForAddress } from "./st
 import * as OrchestrationHttp from "./orchestration-v2/http.ts";
 import * as AivaVoiceHttp from "./aiva/voiceHttp.ts";
 import * as AivaPurge from "./aiva/purge.ts";
+import * as AivaTokenHandover from "./aiva/tokenHandover.ts";
 import * as ProjectHttp from "./project/http.ts";
 import * as NetService from "@t3tools/shared/Net";
 import * as RelayClient from "@t3tools/shared/relayClient";
@@ -845,6 +846,8 @@ const layerMakeRoutes = Layer.mergeAll(
     Layer.provide(ProviderAdapterRegistry.layerFromProviderInstanceRegistry),
     Layer.provide(McpOAuth.layerMcpClientAuthenticator),
   ),
+  // P15: restarts a Claude turn whose renewed account's old token was refused.
+  AivaTokenHandover.layer,
   // Follows delegated tasks running in linked environments, including after a restart.
   Layer.effectDiscard(
     RemoteDelegation.RemoteDelegation.pipe(Effect.flatMap((remote) => remote.start())),

@@ -5,7 +5,13 @@ import {
   aivaClaudeInterruptRestart,
   aivaClaudeTokenStale,
   aivaRememberClaudeToken,
+  aivaRenewalCancelledWorkNote,
+  aivaRequestTokenHandover,
 } from "../../aiva/oauthToken.ts";
+import {
+  cancelledRosterTaskWork,
+  mergeRestartCancelledBackgroundWork,
+} from "../RestartBackgroundNote.ts";
 import {
   compactDynamicToolOutput,
   mcpToolResultOutput,
@@ -10550,6 +10556,15 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           }
 
           if (message.type === "system" && message.subtype === "api_retry") {
+            // P15: a renewed account's old token refused mid-turn: restart the turn with the new one.
+            if (message.error_status === 401 && aivaClaudeTokenStale(input.query)) {
+              aivaRequestTokenHandover({
+                projectId: context.input.appThread.projectId,
+                threadId: context.input.threadId,
+                runId: context.input.runId,
+                attemptId: context.input.attemptId,
+              });
+            }
             const updatedAt = yield* DateTime.now;
             const previous = (yield* Ref.get(providerRetries)).get(context.providerTurnId);
             const retry: OrchestrationV2ProviderRetry = {
@@ -12134,6 +12149,37 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           live.selection = selection;
         });
 
+        // P15: the background work a stale-token process still runs, which reopening it ends.
+        const workEndedByTokenRenewal = Effect.fnUntraced(function* (nativeThreadId: string) {
+          const existing = yield* Ref.get(queryContext);
+          if (
+            existing === null ||
+            existing.stopping ||
+            existing.nativeThreadId !== nativeThreadId ||
+            !aivaClaudeTokenStale(existing.query)
+          ) {
+            return [];
+          }
+          const roster = rosterForNativeThread(
+            yield* Ref.get(pendingBackgroundTasksByNativeThread),
+            nativeThreadId,
+          );
+          const subagents = [...(yield* Ref.get(sessionSubagentsByTaskId)).values()].filter(
+            (subagent) =>
+              subagent.task.status === "running" &&
+              !existing.subagentsFromEarlierProcesses.has(subagent),
+          );
+          return mergeRestartCancelledBackgroundWork(
+            [...roster.values()].map(cancelledRosterTaskWork),
+            subagents.map((subagent) => ({
+              kind: "subagent" as const,
+              label:
+                (subagent.task.title ?? subagent.task.prompt).trim().slice(0, 160) || "subagent",
+              id: subagent.task.id,
+            })),
+          );
+        });
+
         const openQuery = Effect.fnUntraced(function* (
           turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
           nativeThreadId: string,
@@ -12576,8 +12622,15 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               pdfBudgets.get(nativeThreadId)!,
               persistAttachmentBudget(nativeThreadId),
             );
+            // P15: background work a stale-token process loses when it's reopened is told to this turn.
+            const renewalNote =
+              promptUuid === null
+                ? ""
+                : aivaRenewalCancelledWorkNote(yield* workEndedByTokenRenewal(nativeThreadId));
             const promptText = applyClaudePromptEffortPrefix(
-              turnInput.message.text,
+              renewalNote === ""
+                ? turnInput.message.text
+                : `${renewalNote}\n\n${turnInput.message.text}`,
               compileClaudeModelSelection(turnInput.modelSelection, modelCatalog).promptEffort,
             );
             const userMessage =

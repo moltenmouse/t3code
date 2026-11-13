@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off -- workflow fixtures use files and the fake Claude CLI uses Node streams
+import { takeTokenHandoverRequests } from "../../aiva/oauthToken.ts";
 import * as NodeEvents from "node:events";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
@@ -20510,6 +20511,16 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     ),
   );
 
+  /** Points the aiva settings at `file`; returns the restore. */
+  const useAivaSettingsFile = (file: string) => {
+    const previous = process.env.T3CODE_AIVA_SETTINGS;
+    process.env.T3CODE_AIVA_SETTINGS = file;
+    return () => {
+      if (previous === undefined) delete process.env.T3CODE_AIVA_SETTINGS;
+      else process.env.T3CODE_AIVA_SETTINGS = previous;
+    };
+  };
+
   // aiva P15: Claude Code never asks t3 for a renewed token, so the next turn after a renewal
   // reopens a process that still holds the old (revoked) one, however long it sat idle, and even
   // with a background shell running (a process with a revoked token can't reach Claude at all).
@@ -20524,15 +20535,10 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         const tokenFile = NodePath.join(dir, "claude-account-2");
         yield* fileSystem.writeFileString(settingsPath, "{}");
         yield* fileSystem.writeFileString(tokenFile, "token-1");
-        const previousSettings = process.env.T3CODE_AIVA_SETTINGS;
-        process.env.T3CODE_AIVA_SETTINGS = settingsPath;
-        yield* Effect.addFinalizer(() =>
-          Effect.sync(() => {
-            if (previousSettings === undefined) delete process.env.T3CODE_AIVA_SETTINGS;
-            else process.env.T3CODE_AIVA_SETTINGS = previousSettings;
-          }),
-        );
+        const restoreSettings = useAivaSettingsFile(settingsPath);
+        yield* Effect.addFinalizer(() => Effect.sync(restoreSettings));
         const openedTokens: Array<string | undefined> = [];
+        const prompts: Array<string> = [];
         let closes = 0;
         const processQueues: Array<Queue.Queue<SDKMessage>> = [];
         const events: Array<ProviderAdapter.ProviderAdapterV2Event> = [];
@@ -20561,11 +20567,18 @@ describe("ClaudeAdapterV2 background wake turns", () => {
                 processQueues.push(sdkMessages);
                 return {
                   messages: Stream.fromQueue(sdkMessages),
-                  offer: () => Effect.void,
+                  offer: (message: unknown) =>
+                    Effect.sync(() => {
+                      prompts.push(JSON.stringify(message));
+                    }),
                   setModel: () => Effect.void,
                   applyFlagSettings: () => Effect.void,
                   setPermissionMode: () => Effect.void,
                   backgroundTasks: () => Effect.succeed(false),
+                  mcpServerStatus: Effect.succeed([]),
+                  readMcpResource: () => Effect.die("unexpected MCP resource read"),
+                  callMcpTool: () => Effect.die("unexpected MCP tool call"),
+                  listPermissionRules: Effect.die("unexpected permission rules read"),
                   stopTask: () => Effect.void,
                   interrupt: Effect.void,
                   close: Effect.sync(() => {
@@ -20575,6 +20588,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
               }),
             forkSession: () => Effect.die("unused forkSession"),
             subagentLaunchToolUseId: () => Effect.succeed(null),
+            subagentModel: () => Effect.succeed(null),
             assertComplete: Effect.void,
           },
         });
@@ -20600,20 +20614,38 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         );
         const now = yield* DateTime.now;
         const terminals = () => events.filter((event) => event.type === "turn.terminal").length;
-        const turn = (n: number, text: string, startsShell = false) =>
+        const refused = (n: number) =>
+          claudeSdkFrame({
+            type: "system",
+            subtype: "api_retry",
+            attempt: 1,
+            max_retries: 10,
+            retry_delay_ms: 500,
+            error_status: 401,
+            error: "authentication_failed",
+            uuid: `00000000-0000-4000-8000-00000000c00${n}`,
+            session_id: WAKE_NATIVE_SESSION,
+          });
+        const turn = (
+          n: number,
+          text: string,
+          startsShell = false,
+          midTurn: Effect.Effect<void> = Effect.void,
+        ) =>
           Effect.gen(function* () {
             yield* runtime.startTurn(
               makeClaudeTestTurnInput({
                 threadId,
                 providerThread: n === 1 ? providerThread : { ...providerThread, status: "active" },
                 now,
-                attemptId: RunAttemptId.make(`attempt-claude-renewed-token-${n}`),
+                attemptId: RunAttemptId.make(`attempt-claude-renewed-token-${background}-${n}`),
                 text,
                 attachments: [],
                 providerTurnOrdinal: n,
               }),
             );
             if (startsShell) yield* Queue.offer(processQueues.at(-1)!, wakeTaskStarted);
+            yield* midTurn;
             yield* Queue.offer(
               processQueues.at(-1)!,
               makeResultFrame({
@@ -20624,18 +20656,45 @@ describe("ClaudeAdapterV2 background wake turns", () => {
             yield* changes.until(() => terminals() === n);
           });
 
-        yield* turn(1, "First.");
-        // The same token next turn: the process is kept.
-        yield* turn(2, "Second.", background);
+        takeTokenHandoverRequests();
+        // A refused token that is still the account's own (nothing renewed): no restart.
+        yield* turn(
+          1,
+          "First.",
+          false,
+          Effect.suspend(() => Queue.offer(processQueues[0]!, refused(1))),
+        );
+        assert.deepEqual(takeTokenHandoverRequests(), []);
+        // The same token next turn: the process is kept. Mid-turn the sidecar renews the account
+        // (the old token is revoked, the file rewritten): its next model call is refused, and
+        // the turn is restarted in place, once.
+        yield* turn(
+          2,
+          "Second.",
+          background,
+          Effect.gen(function* () {
+            yield* fileSystem.writeFileString(tokenFile, "token-2").pipe(Effect.orDie);
+            yield* Queue.offer(processQueues[0]!, refused(2));
+            yield* Queue.offer(processQueues[0]!, refused(3));
+          }),
+        );
+        assert.deepEqual(
+          takeTokenHandoverRequests().map((request) => [request.threadId, request.attemptId]),
+          [[threadId, `attempt-claude-renewed-token-${background}-2`]],
+        );
         if (background) assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
         assert.deepEqual(openedTokens, ["token-1"]);
-        // The sidecar renews the account (the old token is revoked) and rewrites the file.
-        yield* fileSystem.writeFileString(tokenFile, "token-2");
         yield* turn(3, "Third.");
         assert.deepEqual(openedTokens, ["token-1", "token-2"]);
         assert.equal(closes, 1);
+        // The reopened process's first prompt says what its background shell was, and that it ended.
+        const third = prompts.find((prompt) => prompt.includes("Third."));
+        assert.isDefined(third);
+        assert.equal(third!.includes("sign-in on this machine was renewed"), background);
+        if (background) assert.include(third!, WAKE_TASK_DESCRIPTION);
         // And the new process is kept while the token stays.
         yield* turn(4, "Fourth.");
+        assert.isFalse(prompts.find((prompt) => prompt.includes("Fourth."))!.includes("renewed"));
         assert.deepEqual(openedTokens, ["token-1", "token-2"]);
       }).pipe(
         Effect.provide(

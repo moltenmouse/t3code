@@ -7,6 +7,13 @@
 import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
 
+import type {
+  OrchestrationV2RestartCancelledBackgroundWork,
+  ProjectId,
+  RunId,
+  ThreadId,
+} from "@t3tools/contracts";
+
 import { loadAivaSettings } from "./settings.ts";
 
 export const TOKEN_FILE_ENV = "AIVA_CLAUDE_OAUTH_TOKEN_FILE";
@@ -143,4 +150,57 @@ export function aivaClaudeTokenStale(query: object): boolean {
  */
 export function aivaClaudeInterruptRestart(): boolean {
   return loadAivaSettings() !== null;
+}
+
+/** What a turn restarted with its account's renewed token is told (the Aiva sidecar's words too). */
+export const AIVA_TOKEN_HANDOVER_TEXT =
+  "Your Claude sign-in on this machine was renewed during this turn. Carry on exactly where you left off.";
+
+const MAX_NOTE_ENTRIES = 10;
+
+/**
+ * What the turn after a stale-token process was reopened is told about the background work that
+ * ended with it (the CLI's shells and subagents die with its process), as t3's restart note does.
+ */
+export function aivaRenewalCancelledWorkNote(
+  work: ReadonlyArray<OrchestrationV2RestartCancelledBackgroundWork>,
+): string {
+  if (work.length === 0) return "";
+  const omitted = work.length - MAX_NOTE_ENTRIES;
+  return [
+    "Note: your Claude sign-in on this machine was renewed, so the process running this background work had to be restarted, and the work was cancelled before it finished. It will not report back on its own, so resume or restart what you still need and wait for its result:",
+    ...work.slice(0, MAX_NOTE_ENTRIES).map((entry) => `- ${entry.kind}: ${entry.label}`),
+    ...(omitted > 0 ? [`- and ${omitted} more`] : []),
+  ].join("\n");
+}
+
+export interface TokenHandoverRequest {
+  readonly projectId: ProjectId;
+  readonly threadId: ThreadId;
+  readonly runId: RunId;
+  /** One restart per attempt, however often Claude Code retries the refused token. */
+  readonly attemptId: string;
+}
+
+const pending: Array<TokenHandoverRequest> = [];
+const asked = new Set<string>();
+let wake: (() => void) | null = null;
+
+/** The handover worker (tokenHandover.ts) listens here. */
+export function onTokenHandoverRequest(listener: () => void): void {
+  wake = listener;
+}
+
+/** Called from the Claude adapter when a stale-token process has a model call refused. */
+export function aivaRequestTokenHandover(request: TokenHandoverRequest): void {
+  if (asked.has(request.attemptId)) return;
+  if (asked.size >= 1_000) asked.clear();
+  asked.add(request.attemptId);
+  pending.push(request);
+  wake?.();
+}
+
+/** The requests made so far and not yet taken (tests). */
+export function takeTokenHandoverRequests(): Array<TokenHandoverRequest> {
+  return pending.splice(0);
 }
