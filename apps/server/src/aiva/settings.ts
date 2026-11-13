@@ -22,9 +22,20 @@ export interface AivaMcpServer {
   readonly headers: Readonly<Record<string, string>>;
 }
 
+export interface AivaNativeTools {
+  readonly claude: ReadonlyArray<string>;
+  readonly codex: ReadonlyArray<string>;
+}
+
 export interface AivaSettings {
   /** t3 MCP tools agents never see, e.g. `t3_thread_send`. */
   readonly disabledTools: ReadonlyArray<string>;
+  /**
+   * The agents' own built-in tools they never get, per provider: Claude tool names
+   * (e.g. `AskUserQuestion`, passed as `disallowedTools`), and Codex tools t3 can
+   * switch off through Codex config (`request_user_input`; others are ignored).
+   */
+  readonly disabledNativeTools: AivaNativeTools;
   /** Claude's `Agent` tool and agent teams, and Codex `multi_agent`. Off unless set. */
   readonly nativeSubagents: boolean;
   /** Threads allowed native sub-agents while `nativeSubagents` is off. */
@@ -89,6 +100,14 @@ export function parseAivaSettings(raw: unknown): AivaSettings {
   }
   return {
     disabledTools: strings(input.disabledTools, TOOL_NAME),
+    disabledNativeTools: {
+      claude: isRecord(input.disabledNativeTools)
+        ? strings(input.disabledNativeTools.claude, TOOL_NAME)
+        : [],
+      codex: isRecord(input.disabledNativeTools)
+        ? strings(input.disabledNativeTools.codex, TOOL_NAME)
+        : [],
+    },
     nativeSubagents: input.nativeSubagents === true,
     nativeSubagentThreads: strings(input.nativeSubagentThreads, /^.{1,200}$/),
     mcpServers,
