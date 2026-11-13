@@ -20510,6 +20510,143 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     ),
   );
 
+  // aiva P15: Claude Code never asks t3 for a renewed token, so the next turn after a renewal
+  // reopens a process that still holds the old (revoked) one.
+  it.effect("reopens a live process whose account token was renewed, with the new token", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const changes = yield* makeChangeSignal;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const dir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-claude-v2-token-" });
+        const settingsPath = NodePath.join(dir, "aiva.json");
+        const tokenFile = NodePath.join(dir, "claude-account-2");
+        yield* fileSystem.writeFileString(settingsPath, "{}");
+        yield* fileSystem.writeFileString(tokenFile, "token-1");
+        const previousSettings = process.env.T3CODE_AIVA_SETTINGS;
+        process.env.T3CODE_AIVA_SETTINGS = settingsPath;
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            if (previousSettings === undefined) delete process.env.T3CODE_AIVA_SETTINGS;
+            else process.env.T3CODE_AIVA_SETTINGS = previousSettings;
+          }),
+        );
+        const openedTokens: Array<string | undefined> = [];
+        let closes = 0;
+        const processQueues: Array<Queue.Queue<SDKMessage>> = [];
+        const events: Array<ProviderAdapter.ProviderAdapterV2Event> = [];
+        const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
+          instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
+          settings: DEFAULT_CLAUDE_SETTINGS,
+          // As the Aiva sidecar sets an account up: its token, and the file it keeps current.
+          environment: {
+            CLAUDE_CODE_OAUTH_TOKEN: "token-1",
+            AIVA_CLAUDE_OAUTH_TOKEN_FILE: tokenFile,
+          },
+          attachmentsDir: dir,
+          fileSystem,
+          path: yield* Path.Path,
+          random: yield* SecureRandom.SecureRandom,
+          idAllocator,
+          continuationRequests: {
+            offer: () => Effect.void,
+          },
+          queryRunner: {
+            allocateSessionId: Effect.succeed(WAKE_NATIVE_SESSION),
+            open: (input) =>
+              Effect.gen(function* () {
+                openedTokens.push(input.options.env?.CLAUDE_CODE_OAUTH_TOKEN);
+                const sdkMessages = yield* Queue.unbounded<SDKMessage>();
+                processQueues.push(sdkMessages);
+                return {
+                  messages: Stream.fromQueue(sdkMessages),
+                  offer: () => Effect.void,
+                  setModel: () => Effect.void,
+                  applyFlagSettings: () => Effect.void,
+                  setPermissionMode: () => Effect.void,
+                  backgroundTasks: () => Effect.succeed(false),
+                  stopTask: () => Effect.void,
+                  interrupt: Effect.void,
+                  close: Effect.sync(() => {
+                    closes += 1;
+                  }).pipe(Effect.andThen(Queue.shutdown(sdkMessages))),
+                };
+              }),
+            forkSession: () => Effect.die("unused forkSession"),
+            subagentLaunchToolUseId: () => Effect.succeed(null),
+            assertComplete: Effect.void,
+          },
+        });
+        const threadId = ThreadId.make("thread-claude-renewed-token");
+        const runtime = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("provider-session-claude-renewed-token"),
+          modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+          runtimePolicy: CLAUDE_TEST_RUNTIME_POLICY,
+        });
+        const providerThread = yield* runtime.ensureThread({
+          threadId,
+          modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+          runtimePolicy: CLAUDE_TEST_RUNTIME_POLICY,
+        });
+        yield* runtime.events.pipe(
+          Stream.runForEach((event) =>
+            Effect.sync(() => {
+              events.push(event);
+            }).pipe(Effect.andThen(changes.notify)),
+          ),
+          Effect.forkScoped,
+        );
+        const now = yield* DateTime.now;
+        const terminals = () => events.filter((event) => event.type === "turn.terminal").length;
+        const turn = (n: number, text: string) =>
+          Effect.gen(function* () {
+            yield* runtime.startTurn(
+              makeClaudeTestTurnInput({
+                threadId,
+                providerThread: n === 1 ? providerThread : { ...providerThread, status: "active" },
+                now,
+                attemptId: RunAttemptId.make(`attempt-claude-renewed-token-${n}`),
+                text,
+                attachments: [],
+                providerTurnOrdinal: n,
+              }),
+            );
+            yield* Queue.offer(
+              processQueues.at(-1)!,
+              makeResultFrame({
+                uuid: `00000000-0000-4000-8000-00000000b00${n}`,
+                result: `turn ${n}`,
+              }),
+            );
+            yield* changes.until(() => terminals() === n);
+          });
+
+        yield* turn(1, "First.");
+        // The same token next turn: the process is kept.
+        yield* turn(2, "Second.");
+        assert.deepEqual(openedTokens, ["token-1"]);
+        // The sidecar renews the account (the old token is revoked) and rewrites the file.
+        yield* fileSystem.writeFileString(tokenFile, "token-2");
+        yield* turn(3, "Third.");
+        assert.deepEqual(openedTokens, ["token-1", "token-2"]);
+        assert.equal(closes, 1);
+        // And the new process is kept while the token stays.
+        yield* turn(4, "Fourth.");
+        assert.deepEqual(openedTokens, ["token-1", "token-2"]);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            NodeCrypto.layer,
+          ),
+        ),
+      ),
+    ),
+  );
+
   const WORKFLOW_TASK_ID = "task-workflow-run";
   const WORKFLOW_TOOL_USE_ID = "toolu-workflow-run";
   const makeWorkflowHarnessWithOptions = (
