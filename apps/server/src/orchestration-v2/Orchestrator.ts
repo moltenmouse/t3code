@@ -5399,8 +5399,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     "Session has an active turn. Wait for the turn to finish before resetting context.";
 
   // Aiva P16: old Aiva's "Reset context" (a fresh agent session; same worktree, branch and machine). The thread's
-  // provider sessions detach and its active provider thread forgets its native thread, so the next turn calls
-  // ensureThread on that row instead of resuming the old conversation. The transcript stays.
+  // provider sessions detach and its provider threads forget their native threads, so the next turn calls
+  // ensureThread on whichever row it goes to instead of resuming an old conversation. The transcript stays.
   const dispatchThreadContextReset = Effect.fn("orchestrationV2.dispatch.threadContextReset")(
     function* (
       command: Extract<OrchestrationV2Command, { readonly type: "thread.context.reset" }>,
@@ -5445,9 +5445,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           );
         }
       }
-      const active = projection.providerThreads.find(
-        (thread) => thread.id === projection.thread.activeProviderThreadId,
-      );
       const now = yield* DateTime.now;
       const reason = "Context reset.";
       for (const session of live) {
@@ -5474,37 +5471,43 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         } satisfies PendingOrchestrationEffectV2;
         yield* Ref.update(effects, (existing) => [...existing, pendingEffect]);
       }
-      // Nothing to forget (never ran, or already reset with no run since): the detach alone is the reset.
+      // Every conversation of the thread is forgotten, not only the active row: after a scheduled fresh-session
+      // run the active row is that side conversation, and the next message goes back to the ordinary one; a
+      // provider switch back resumes that provider's row. Rows already fresh (never ran, or reset with no run
+      // since) are left as they are; with none left the detach alone is the reset.
       const lastRun = Math.max(0, ...projection.runs.map((run) => run.ordinal));
-      if (
-        active === undefined ||
-        (active.nativeThreadRef === null &&
-          (active.aivaContextResetAfterRunOrdinal ?? 0) >= lastRun)
-      )
-        return;
-      yield* emit(
-        events,
-        command,
-      )({
-        type: "provider-thread.updated",
-        threadId: command.threadId,
-        driver: active.driver,
-        providerInstanceId: active.providerInstanceId,
-        occurredAt: now,
-        payload: {
-          ...active,
-          nativeThreadRef: null,
-          nativeConversationHeadRef: null,
-          providerSessionId: null,
-          status: "not_loaded",
-          pendingBackgroundTasks: [],
-          contextUsage: null,
-          goal: null,
-          // Runs up to here belong to the forgotten conversation: no retry or handoff brings them back.
-          aivaContextResetAfterRunOrdinal: lastRun,
-          updatedAt: now,
-        },
-      });
+      const forgotten = projection.providerThreads.filter(
+        (thread) =>
+          (thread.id === projection.thread.activeProviderThreadId ||
+            (thread.appThreadId === command.threadId && thread.ownerNodeId === null)) &&
+          (thread.nativeThreadRef !== null ||
+            (thread.aivaContextResetAfterRunOrdinal ?? 0) < lastRun),
+      );
+      for (const thread of forgotten) {
+        yield* emit(
+          events,
+          command,
+        )({
+          type: "provider-thread.updated",
+          threadId: command.threadId,
+          driver: thread.driver,
+          providerInstanceId: thread.providerInstanceId,
+          occurredAt: now,
+          payload: {
+            ...thread,
+            nativeThreadRef: null,
+            nativeConversationHeadRef: null,
+            providerSessionId: null,
+            status: "not_loaded",
+            pendingBackgroundTasks: [],
+            contextUsage: null,
+            goal: null,
+            // Runs up to here belong to the forgotten conversation: no retry or handoff brings them back.
+            aivaContextResetAfterRunOrdinal: lastRun,
+            updatedAt: now,
+          },
+        });
+      }
     },
   );
 

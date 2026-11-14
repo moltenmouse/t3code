@@ -13,6 +13,7 @@ import {
   ProviderInstanceId,
   ProviderThreadId,
   ProviderTurnId,
+  ScheduledTaskId,
   ThreadId,
 } from "@t3tools/contracts";
 import { checkpointWorkspace } from "@t3tools/provider-testing/replayWorkspace";
@@ -439,6 +440,121 @@ it.live(
           Effect.provide(
             ProviderReplayHarness.layerWithRegistry(
               { name: "aiva-context-reset-retry" },
+              ProviderAdapterRegistry.layerSingle(adapter(calls)),
+            ),
+          ),
+        );
+      }),
+    ),
+);
+
+// Sol (aiva.16 round): upstream's scheduled fresh-session runs make the active provider thread a side conversation.
+// A reset must forget the conversation the next ordinary message goes to, not only the active row.
+it.live(
+  "after a scheduled fresh-session run, a reset forgets the conversation the next message goes to",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const cwd = yield* checkpointWorkspace("aiva-context-reset-scheduled");
+        const threadId = ThreadId.make("thread:aiva-context-reset-scheduled");
+        const calls = yield* Ref.make<Calls>({
+          sessions: 0,
+          closed: 0,
+          ensured: [],
+          resumed: [],
+          cwds: [],
+        });
+
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const eventSink = yield* EventSink.EventSinkV2;
+          const runEnds = Effect.gen(function* () {
+            return yield* eventSink
+              .stream({ threadId, afterSequence: yield* eventSink.latestSequence({ threadId }) })
+              .pipe(
+                Stream.map((stored) => stored.event),
+                Stream.filter(
+                  (event) => event.type === "run.updated" && event.payload.status === "completed",
+                ),
+                Stream.take(1),
+                Stream.runDrain,
+                Effect.forkScoped,
+              );
+          });
+          let n = 0;
+          const send = (text: string, scheduled = false) =>
+            orchestrator.dispatch({
+              type: "message.dispatch",
+              createdBy: "user",
+              creationSource: "web",
+              commandId: CommandId.make(`command:reset-scheduled:send:${++n}`),
+              threadId,
+              messageId: MessageId.make(`message:reset-scheduled:${n}`),
+              text,
+              attachments: [],
+              modelSelection: selection,
+              // As ScheduledTaskService sends a `fresh_session` task's run.
+              ...(scheduled
+                ? {
+                    scheduledTaskId: ScheduledTaskId.make("scheduled:reset-fresh"),
+                    freshContext: true,
+                    dispatchMode: { type: "queue_after_active" as const },
+                  }
+                : { dispatchMode: { type: "start_immediately" as const } }),
+            });
+          const turn = (text: string, scheduled = false) =>
+            Effect.gen(function* () {
+              const done = yield* runEnds;
+              yield* send(text, scheduled);
+              yield* Fiber.join(done);
+              yield* worker.drain();
+            });
+
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            createdBy: "user",
+            creationSource: "web",
+            commandId: CommandId.make("command:reset-scheduled:create"),
+            threadId,
+            projectId: ProjectId.make("project:reset-scheduled"),
+            title: "Reset after a scheduled run",
+            modelSelection: selection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: "feature/reset-scheduled",
+            worktreePath: cwd,
+          });
+          // A: the ordinary conversation. B: a scheduled fresh-session run, now the active provider thread.
+          yield* turn("first: remember the word banana");
+          yield* turn("Scheduled check", true);
+          const before = yield* orchestrator.getThreadProjection(threadId);
+          const active = before.providerThreads.find(
+            (t) => t.id === before.thread.activeProviderThreadId,
+          )!;
+          assert.equal(active.nativeThreadRef?.nativeId, "native-thread:2", "B is the active row");
+          assert.deepEqual((yield* Ref.get(calls)).ensured, ["native-thread:1", "native-thread:2"]);
+
+          yield* orchestrator.dispatch({
+            type: "thread.context.reset",
+            commandId: CommandId.make("command:reset-scheduled:reset"),
+            threadId,
+          });
+          yield* worker.drain();
+          yield* turn("after the reset");
+          const seen = yield* Ref.get(calls);
+          assert.deepEqual(seen.resumed, [], "neither conversation from before the reset resumes");
+          assert.lengthOf(seen.ensured, 3, "the next message starts a new native conversation");
+          assert.include(seen.texts?.at(-1) ?? "", "after the reset");
+          assert.notInclude(seen.texts?.at(-1) ?? "", "banana", "and gets no summary of A");
+
+          // A notification goes to the active row (B): it starts fresh too.
+          yield* turn("Scheduled check again", true);
+          assert.deepEqual((yield* Ref.get(calls)).resumed, []);
+        }).pipe(
+          Effect.provide(
+            ProviderReplayHarness.layerWithRegistry(
+              { name: "aiva-context-reset-scheduled" },
               ProviderAdapterRegistry.layerSingle(adapter(calls)),
             ),
           ),
