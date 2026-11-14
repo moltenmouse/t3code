@@ -193,19 +193,22 @@ const dispatcher = Layer.effectDiscard(
     // An idle session's app-server (released after a while) comes back for a call as it would for
     // a turn: t3's own session manager opens the session and resumes the native thread.
     const sessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
+    // The call runs on the conversation the session's next typed message would go to, by t3's own
+    // routing: after a scheduled fresh-session run the active provider thread is that run's side
+    // conversation, and the ordinary one is another row.
     const codexThread = (threadId: string) =>
-      projections.getThread(ThreadId.make(threadId)).pipe(
-        // Provider threads come back only for the instance asked about: the thread's own.
-        Effect.flatMap((thread) =>
-          projections.getThreadProviderContext(thread.id, thread.modelSelection.instanceId),
-        ),
-        Effect.map((context) => {
-          const providerThread = context.providerThreads.find(
-            (candidate) => candidate.id === context.thread.activeProviderThreadId,
-          );
-          return { context, providerThread };
-        }),
-      );
+      projections
+        .getThreadRecords(
+          ThreadId.make(threadId),
+          ["runs", "providerThreads", "providerSessions", "turnItems"],
+          { turnItemTypes: ["user_message"] },
+        )
+        .pipe(
+          Effect.map((context) => ({
+            context,
+            providerThread: Orchestrator.conversationProviderThread(context),
+          })),
+        );
     aivaVoice.setWaker({
       readiness: (threadId) =>
         codexThread(threadId).pipe(
@@ -223,7 +226,9 @@ const dispatcher = Layer.effectDiscard(
         const { context, providerThread } = yield* codexThread(threadId);
         const providerSessionId = providerThread?.providerSessionId;
         const nativeThreadId = providerThread?.nativeThreadRef?.nativeId;
-        if (providerThread === undefined || providerSessionId == null || !nativeThreadId) return;
+        if (providerThread === undefined || providerSessionId == null || !nativeThreadId) {
+          return nativeThreadId || null;
+        }
         const thread = context.thread;
         const policy = yield* runtimePolicy.resolve({
           thread,
@@ -252,6 +257,7 @@ const dispatcher = Layer.effectDiscard(
           modelSelection: thread.modelSelection,
           runtimePolicy: policy,
         });
+        return nativeThreadId;
       }),
     });
     yield* Effect.addFinalizer(() =>

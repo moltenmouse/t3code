@@ -7542,11 +7542,19 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
           claim: AivaVoiceClaim,
         ) {
-          if (claim.type === "expired") {
-            return yield* completeGoalCommandTurn(
-              turnInput,
-              "Codex worked on this in the voice call, but its turn couldn't be shown here.",
-            );
+          const unshown =
+            "Codex worked on this in the voice call, but its turn couldn't be shown here.";
+          if (claim.type === "expired") return yield* completeGoalCommandTurn(turnInput, unshown);
+          // Never attach the call's turn to another native conversation's row, and never start it again.
+          const runNativeThreadId = turnInput.providerThread.nativeThreadRef?.nativeId;
+          if (runNativeThreadId !== claim.nativeThreadId) {
+            yield* claim.refuse;
+            yield* Effect.logWarning("aiva voice: a voice run is on another native thread", {
+              threadId: turnInput.threadId,
+              callNativeThreadId: claim.nativeThreadId,
+              runNativeThreadId: runNativeThreadId ?? null,
+            });
+            return yield* completeGoalCommandTurn(turnInput, unshown);
           }
           yield* registerRootTurn({
             turnInput,

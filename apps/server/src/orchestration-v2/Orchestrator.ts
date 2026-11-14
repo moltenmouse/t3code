@@ -1349,7 +1349,7 @@ function contextBoundaryOrdinal(
 }
 
 /** The provider thread a message continues: the active one, unless a fresh-session schedule run started it. */
-function conversationProviderThread(
+export function conversationProviderThread(
   projection: Pick<
     OrchestrationV2ThreadProjection,
     "thread" | "providerThreads" | "runs" | "turnItems"

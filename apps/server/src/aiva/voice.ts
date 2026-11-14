@@ -88,7 +88,12 @@ export interface AivaVoiceSettings {
  */
 export interface AivaVoiceWaker {
   readonly readiness: (threadId: string) => Effect.Effect<"ready" | "neverRun" | "notCodex", Error>;
-  readonly wake: (threadId: string) => Effect.Effect<void, Error>;
+  /**
+   * Brings back the conversation the session's next typed message would go to (upstream's
+   * routing: not a scheduled fresh-session run's side conversation) and names its native thread,
+   * which the call then runs on. Null when there's none to name.
+   */
+  readonly wake: (threadId: string) => Effect.Effect<string | null, Error>;
 }
 
 /** The adapter's way to put `settings` on the thread before a call (`thread/settings/update`). */
@@ -102,6 +107,8 @@ interface Binding {
 }
 
 interface Call {
+  /** The native thread the call runs on; its hand-offs are adopted only on runs of that thread. */
+  readonly binding: Binding;
   readonly voiceSessionId: string;
   readonly generation: number;
   status: "starting" | "started" | "closing";
@@ -119,12 +126,21 @@ interface Adoption {
   readonly nativeThreadId: string;
   readonly nativeTurnId: string;
   readonly messageId: string;
-  readonly attached: Deferred.Deferred<void>;
+  /** True once a run attached the turn; false when the run that claimed it is on another native thread. */
+  readonly attached: Deferred.Deferred<boolean>;
   expired: boolean;
 }
 
 export type AivaVoiceClaim =
-  | { readonly type: "adopt"; readonly nativeTurnId: string; readonly done: Effect.Effect<void> }
+  | {
+      readonly type: "adopt";
+      /** The run must be on this native thread: the one Codex started the turn on. */
+      readonly nativeThreadId: string;
+      readonly nativeTurnId: string;
+      readonly done: Effect.Effect<void>;
+      /** The run is on another native thread: the turn is left to t3's usual handling. */
+      readonly refuse: Effect.Effect<void>;
+    }
   | { readonly type: "expired" };
 
 export class AivaVoiceHub {
@@ -159,15 +175,23 @@ export class AivaVoiceHub {
    * app-server nor unloads the thread; afterwards they go idle and are let go as usual.
    */
   holds(request: AivaVoiceRequest): boolean {
-    for (const [threadId, binding] of this.byThread) {
-      if (binding.request === request && this.calls.has(threadId)) return true;
+    for (const call of this.calls.values()) {
+      if (call.binding.request === request) return true;
     }
     return false;
   }
 
   holdsNative(nativeThreadId: string | null | undefined): boolean {
     const binding = nativeThreadId == null ? undefined : this.byNative.get(nativeThreadId);
-    return binding !== undefined && this.calls.has(binding.appThreadId);
+    return binding !== undefined && this.callOn(binding) !== undefined;
+  }
+
+  /** The call running on `binding`'s native thread, if any (not one on another of the session's). */
+  private callOn(binding: Binding): Call | undefined {
+    const call = this.calls.get(binding.appThreadId);
+    return call !== undefined && call.binding.nativeThreadId === binding.nativeThreadId
+      ? call
+      : undefined;
   }
 
   /** `status`, and whether a call can start now: bound, or an idle Codex session t3 can wake. */
@@ -200,10 +224,8 @@ export class AivaVoiceHub {
     applySettings?: AivaVoiceApplySettings,
   ): void {
     if (!this.enabled()) return;
-    const previous = this.byThread.get(appThreadId);
-    if (previous !== undefined && previous.nativeThreadId !== nativeThreadId) {
-      this.byNative.delete(previous.nativeThreadId);
-    }
+    // A session can have several native threads loaded (a scheduled fresh-session run's beside
+    // the conversation): each keeps its binding, and a call picks the conversation's.
     const binding = { appThreadId, nativeThreadId, request, applySettings };
     this.byThread.set(appThreadId, binding);
     this.byNative.set(nativeThreadId, binding);
@@ -211,12 +233,18 @@ export class AivaVoiceHub {
 
   /** The app-server went away: its threads can't take calls, and their calls are over. */
   release(request: AivaVoiceRequest): void {
-    for (const binding of this.byThread.values()) {
+    for (const binding of this.byNative.values()) {
       if (binding.request !== request) continue;
-      this.byThread.delete(binding.appThreadId);
       this.byNative.delete(binding.nativeThreadId);
+      if (this.byThread.get(binding.appThreadId) === binding) {
+        const other = [...this.byNative.values()].find(
+          (b) => b.appThreadId === binding.appThreadId,
+        );
+        if (other === undefined) this.byThread.delete(binding.appThreadId);
+        else this.byThread.set(binding.appThreadId, other);
+      }
       const call = this.calls.get(binding.appThreadId);
-      if (call === undefined) continue;
+      if (call === undefined || call.binding.nativeThreadId !== binding.nativeThreadId) continue;
       this.calls.delete(binding.appThreadId);
       this.emit({
         type: "status",
@@ -292,6 +320,7 @@ export class AivaVoiceHub {
       }
       // The session's app-server may have been let go since its last turn: bring it back (and
       // its thread loaded) first. A no-op when it's up.
+      let conversation: string | null = null;
       if (hub.waker !== null) {
         const waker = hub.waker;
         const state = yield* waker
@@ -301,7 +330,7 @@ export class AivaVoiceHub {
         if (state === "notCodex") {
           return yield* voiceError(409, "notCodex", "Voice works with Codex sessions.");
         }
-        yield* waker.wake(input.threadId).pipe(
+        conversation = yield* waker.wake(input.threadId).pipe(
           Effect.tapError((cause) =>
             Effect.logWarning("aiva voice: couldn't wake the session for a call", {
               threadId: input.threadId,
@@ -317,8 +346,10 @@ export class AivaVoiceHub {
           ),
         );
       }
-      const binding = hub.byThread.get(input.threadId);
-      if (binding === undefined) return yield* notReady();
+      // The conversation's own native thread, never another the session has loaded.
+      const binding =
+        conversation === null ? hub.byThread.get(input.threadId) : hub.byNative.get(conversation);
+      if (binding === undefined || binding.appThreadId !== input.threadId) return yield* notReady();
       const running = hub.calls.get(input.threadId);
       if (running !== undefined) {
         return yield* running.status === "closing"
@@ -333,6 +364,7 @@ export class AivaVoiceHub {
       }
       const answer = yield* Deferred.make<string, AivaVoiceError>();
       const call: Call = {
+        binding,
         voiceSessionId: input.voiceSessionId,
         generation: input.generation,
         status: "starting",
@@ -432,9 +464,9 @@ export class AivaVoiceHub {
   }): Effect.Effect<void, AivaVoiceError> {
     return Effect.suspend(() => {
       const call = this.calls.get(input.threadId);
-      const binding = this.byThread.get(input.threadId);
       // Stopping a call that already ended (or a stale one) is fine; a newer call is left alone.
-      if (call === undefined || binding === undefined) return Effect.void;
+      if (call === undefined) return Effect.void;
+      const binding = call.binding;
       if (call.voiceSessionId !== input.voiceSessionId || call.generation !== input.generation)
         return Effect.void;
       call.status = "closing";
@@ -465,7 +497,7 @@ export class AivaVoiceHub {
       >;
       const binding = typeof p.threadId === "string" ? this.byNative.get(p.threadId) : undefined;
       if (binding === undefined) return Effect.void;
-      const call = this.calls.get(binding.appThreadId);
+      const call = this.callOn(binding);
       if (call === undefined) return Effect.void;
       const base = {
         threadId: binding.appThreadId,
@@ -547,7 +579,7 @@ export class AivaVoiceHub {
     const hub = this;
     return Effect.gen(function* () {
       const binding = hub.byNative.get(nativeThreadId);
-      const call = binding === undefined ? undefined : hub.calls.get(binding.appThreadId);
+      const call = binding === undefined ? undefined : hub.callOn(binding);
       const dispatch = hub.dispatch;
       if (binding === undefined || call === undefined || dispatch === null) return false;
       const messageId = `${AIVA_VOICE_MESSAGE_PREFIX}${call.generation}:${nativeTurnId}`;
@@ -555,7 +587,7 @@ export class AivaVoiceHub {
         nativeThreadId,
         nativeTurnId,
         messageId,
-        attached: yield* Deferred.make<void>(),
+        attached: yield* Deferred.make<boolean>(),
         expired: false,
       };
       hub.adoptions.set(messageId, adoption);
@@ -568,7 +600,6 @@ export class AivaVoiceHub {
       };
       const adopted = yield* dispatch({ threadId: binding.appThreadId, messageId, text }).pipe(
         Effect.andThen(Deferred.await(adoption.attached)),
-        Effect.as(true),
         Effect.timeoutOrElse({ duration: ADOPT_TIMEOUT, orElse: () => Effect.succeed(false) }),
         Effect.catch((cause) =>
           Effect.logWarning("aiva voice: couldn't start a run for a voice turn", { cause }).pipe(
@@ -595,8 +626,10 @@ export class AivaVoiceHub {
     if (adoption.expired) return { type: "expired" };
     return {
       type: "adopt",
+      nativeThreadId: adoption.nativeThreadId,
       nativeTurnId: adoption.nativeTurnId,
-      done: Deferred.succeed(adoption.attached, undefined).pipe(Effect.asVoid),
+      done: Deferred.succeed(adoption.attached, true).pipe(Effect.asVoid),
+      refuse: Deferred.succeed(adoption.attached, false).pipe(Effect.asVoid),
     };
   }
 

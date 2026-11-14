@@ -332,6 +332,68 @@ describe("aiva voice", () => {
     }),
   );
 
+  // Sol (aiva.16 round): after a scheduled fresh-session run, the session has two native threads loaded: the
+  // ordinary conversation A and the run's side conversation B, bound last (the active provider thread).
+  it.effect(
+    "runs a call on the conversation typed messages go to, not a scheduled run's side one",
+    () =>
+      Effect.gen(function* () {
+        const { hub, requests, dispatched } = setup();
+        hub.bindThread("thread-1", "native-b", (method, params) =>
+          Effect.sync(() => void requests.push({ method, params })).pipe(Effect.as({})),
+        );
+        // t3's waker resolves the ordinary conversation (A, "native-1") and names it.
+        hub.setWaker({
+          readiness: () => Effect.succeed("ready"),
+          wake: () => Effect.succeed("native-1"),
+        });
+        const starting = yield* Effect.forkChild(startCall(hub));
+        yield* Effect.yieldNow;
+        assert.deepStrictEqual(
+          requests
+            .filter((r) => r.method === "thread/realtime/start")
+            .map((r) => (r.params as { threadId: string }).threadId),
+          ["native-1"],
+          "the call starts on A",
+        );
+        // B's realtime notifications and turns aren't this call's.
+        yield* hub.notification("thread/realtime/sdp", { threadId: "native-b", sdp: "wrong" });
+        yield* hub.notification("thread/realtime/sdp", { threadId: "native-1", sdp: "answer" });
+        assert.strictEqual((yield* Fiber.join(starting)).sdpAnswer, "answer");
+        assert.isTrue(hub.holdsNative("native-1"));
+        assert.isFalse(hub.holdsNative("native-b"), "B isn't held by A's call");
+        assert.isFalse(yield* hub.turnStarted("native-b", "turn-b"));
+        assert.deepStrictEqual(dispatched, []);
+
+        // A's hand-off: its claim names A, and a run on another native thread refuses it.
+        yield* hub.notification("thread/realtime/transcript/done", {
+          threadId: "native-1",
+          role: "user",
+          text: "Ship it",
+        });
+        const handoff = yield* Effect.forkChild(hub.turnStarted("native-1", "turn-a"));
+        yield* Effect.yieldNow;
+        const claim = hub.claimAdoption(dispatched[0]!.messageId);
+        assert.strictEqual(claim?.type, "adopt");
+        if (claim?.type !== "adopt") return;
+        assert.strictEqual(claim.nativeThreadId, "native-1");
+        yield* claim.refuse;
+        assert.isFalse(
+          yield* Fiber.join(handoff),
+          "a refused claim leaves the turn to t3's usual handling",
+        );
+
+        // With A gone from its app-server, the next call on the session isn't started on B.
+        hub.setWaker({
+          readiness: () => Effect.succeed("ready"),
+          wake: () => Effect.succeed("native-gone"),
+        });
+        yield* hub.notification("thread/realtime/closed", { threadId: "native-1" });
+        const refused = yield* Effect.flip(startCall(hub, 2));
+        assert.strictEqual(refused.code, "notReady");
+      }),
+  );
+
   it.effect("leaves turns alone outside a call, and for other threads", () =>
     Effect.gen(function* () {
       const { hub, dispatched } = setup();
@@ -399,6 +461,7 @@ describe("aiva voice", () => {
             Effect.sync(() => {
               woken += 1;
               hub.bindThread("thread-1", "native-1", request);
+              return "native-1";
             }),
         });
         const ready = yield* hub.readiness("thread-1");

@@ -13,6 +13,7 @@ import {
   NodeId,
   ProjectId,
   ProviderSessionId,
+  ProviderThreadId,
   RunAttemptId,
   RunId,
   ThreadId,
@@ -278,7 +279,12 @@ describe("voice turns in the Codex adapter (P11)", () => {
     aivaVoice.setSettingsSource(null);
   });
 
-  it.effect("shows the turn Codex starts for a voice request as a run with what was said", () => {
+  // `onOtherRow`: Sol (aiva.16 round): the hand-off's run lands on another native conversation's
+  // provider-thread row (after a scheduled fresh-session run). The adapter must not attach the
+  // call's turn there, nor start Codex on it again: the run ends with a note.
+  const voiceRun = (onOtherRow: boolean) => {
+    // The hub is shared by the cases: each call is newer than the last.
+    const generation = onOtherRow ? 2 : 1;
     const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "aiva-voice-"));
     NodeFS.writeFileSync(NodePath.join(dir, "aiva.json"), "{}");
     process.env.T3CODE_AIVA_SETTINGS = NodePath.join(dir, "aiva.json");
@@ -359,12 +365,21 @@ describe("voice turns in the Codex adapter (P11)", () => {
       yield* Effect.addFinalizer(() => Effect.sync(unsubscribe));
       const dispatched: Array<string> = [];
       // t3's orchestrator would start a run for the message; here the test starts it directly.
+      const otherRow: OrchestrationV2ProviderThread = {
+        ...providerThread,
+        id: ProviderThreadId.make("provider-thread-ordinary-a"),
+        nativeThreadRef: {
+          driver: CodexAdapterV2.CODEX_DRIVER_KIND,
+          nativeId: "native-thread-a",
+          strength: "strong",
+        },
+      };
       aivaVoice.setDispatch((message) =>
         Effect.gen(function* () {
           dispatched.push(message.text);
           yield* runtime.startTurn(
             turnInput(
-              providerThread,
+              onOtherRow ? otherRow : providerThread,
               "voice",
               message.messageId,
               message.text,
@@ -382,7 +397,7 @@ describe("voice turns in the Codex adapter (P11)", () => {
       const call = yield* aivaVoice.start({
         threadId: THREAD_ID,
         voiceSessionId: "call-1",
-        generation: 1,
+        generation,
         sdpOffer: "offer",
       });
       assert.strictEqual(call.sdpAnswer, "answer");
@@ -394,23 +409,47 @@ describe("voice turns in the Codex adapter (P11)", () => {
           ? [[event.providerTurn.runAttemptId, event.providerTurn.nativeTurnRef?.nativeId ?? null]]
           : [],
       );
-      assert.deepStrictEqual(running, [
-        ["typed", "typed-turn"],
-        ["voice", "voice-turn"],
-      ]);
+      // On the other row the run only carries its note (no native turn); Codex's turn is attached nowhere.
+      assert.deepStrictEqual(
+        running,
+        onOtherRow
+          ? [
+              ["typed", "typed-turn"],
+              ["voice", null],
+            ]
+          : [
+              ["typed", "typed-turn"],
+              ["voice", "voice-turn"],
+            ],
+      );
       const answers = events.flatMap((event) =>
         event.type === "message.updated" ? [event.message.text] : [],
       );
-      assert.include(answers, "Four.");
+      if (onOtherRow) {
+        assert.include(
+          answers,
+          "Codex worked on this in the voice call, but its turn couldn't be shown here.",
+        );
+        assert.isFalse(
+          events.some(
+            (event) =>
+              event.type === "provider_turn.updated" &&
+              event.providerTurn.nativeTurnRef?.nativeId === "voice-turn",
+          ),
+          "the call's native turn is attached to no run, so not to the other row",
+        );
+      } else {
+        assert.include(answers, "Four.");
+      }
       assert.deepStrictEqual(
         voiceEvents.find((event) => event.type === "turn"),
         {
           type: "turn",
           threadId: THREAD_ID,
           voiceSessionId: "call-1",
-          generation: 1,
-          messageId: `${AIVA_VOICE_MESSAGE_PREFIX}1:voice-turn`,
-          adopted: true,
+          generation,
+          messageId: `${AIVA_VOICE_MESSAGE_PREFIX}${generation}:voice-turn`,
+          adopted: !onOtherRow,
         },
       );
     }).pipe(
@@ -424,7 +463,13 @@ describe("voice turns in the Codex adapter (P11)", () => {
         ),
       ),
     );
-  });
+  };
+  it.effect("shows the turn Codex starts for a voice request as a run with what was said", () =>
+    voiceRun(false),
+  );
+  it.effect("never attaches the call's turn to another native conversation's row", () =>
+    voiceRun(true),
+  );
 
   it.effect("keeps a call's offer and answer out of t3's protocol log", () =>
     Effect.gen(function* () {
