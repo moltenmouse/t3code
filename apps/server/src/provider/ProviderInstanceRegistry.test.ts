@@ -117,6 +117,14 @@ const makeClaudeConfig = (overrides: Partial<ClaudeSettings>): ClaudeSettings =>
   ...overrides,
 });
 
+/** Points the aiva patches at `path` (undefined: back to the default); answers the previous one. */
+const swapAivaSettingsPath = (path: string | undefined): string | undefined => {
+  const previous = process.env.T3CODE_AIVA_SETTINGS;
+  if (path === undefined) delete process.env.T3CODE_AIVA_SETTINGS;
+  else process.env.T3CODE_AIVA_SETTINGS = path;
+  return previous;
+};
+
 const makeTildeProviderFixtures = Effect.fn(
   "ProviderInstanceRegistry.test.makeTildeProviderFixtures",
 )(function* () {
@@ -696,6 +704,100 @@ describe("ProviderInstanceRegistry — multi-instance codex slice", () => {
       );
       expect(probeCount).toBeGreaterThan(sameAccountFailureProbeCount);
     }).pipe(Effect.provide(layerTest)),
+  );
+
+  // P18: Claude Code files usage under the account its config folder last recorded, and trusts
+  // that record for a while whatever token it runs with. Two logins sharing one folder (as the
+  // Aiva sidecar sets them up) read each other's numbers unless each probe has a folder of its own.
+  it.effect.each([
+    { aivaJson: false, gmailSees: 11, workSees: 11 },
+    { aivaJson: true, gmailSees: 11, workSees: 77 },
+  ])("reads each Claude login's own usage from a shared home (aiva.json: $aivaJson)", (scenario) =>
+    Effect.gen(function* () {
+      if (yield* HostProcess.isWindows) return;
+
+      const fixtures = yield* makeTildeProviderFixtures();
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const settingsDir = yield* fs.makeTempDirectoryScoped();
+      const settingsPath = path.join(settingsDir, "aiva.json");
+      if (scenario.aivaJson) yield* fs.writeFileString(settingsPath, "{}");
+      yield* Effect.acquireRelease(
+        Effect.sync(() => swapAivaSettingsPath(settingsPath)),
+        (previous) => Effect.sync(() => swapAivaSettingsPath(previous)),
+      );
+
+      const accounts: Record<string, { email: string; used: number }> = {
+        "token-gmail": { email: "gmail@example.com", used: 11 },
+        "token-work": { email: "work@example.com", used: 77 },
+      };
+      // The account each config folder has recorded, as Claude Code's .claude.json would.
+      const recorded = new Map<string, { email: string; used: number }>();
+      const probeFolders: Array<string | undefined> = [];
+      const query = vi.spyOn(ClaudeSdk, "query").mockImplementation(({ options }) => {
+        const folder = options?.env?.CLAUDE_CONFIG_DIR;
+        probeFolders.push(folder);
+        const own = accounts[options?.env?.CLAUDE_CODE_OAUTH_TOKEN ?? ""]!;
+        const reading = recorded.get(folder ?? "") ?? own;
+        recorded.set(folder ?? "", reading);
+        return {
+          initializationResult: async () => ({
+            commands: [],
+            account: { subscriptionType: "max", tokenSource: "CLAUDE_CODE_OAUTH_TOKEN" },
+          }),
+          usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: async () => ({
+            rate_limits_available: true,
+            rate_limits: {
+              five_hour: { utilization: reading.used, resets_at: "2026-11-15T03:00:00Z" },
+            },
+          }),
+        } as unknown as ReturnType<typeof ClaudeSdk.query>;
+      });
+      yield* Effect.addFinalizer(() => Effect.sync(() => query.mockRestore()));
+
+      const login = (token: string) => ({
+        driver: ProviderDriverKind.make("claudeAgent"),
+        enabled: true,
+        environment: [{ name: "CLAUDE_CODE_OAUTH_TOKEN", value: token, sensitive: false }],
+        config: makeClaudeConfig({
+          enabled: true,
+          binaryPath: fixtures.claudeBinaryPath,
+          homePath: fixtures.claudeHomePath,
+        }),
+      });
+      const gmailId = ProviderInstanceId.make("claude_gmail");
+      const workId = ProviderInstanceId.make("claude_work");
+      const { registry } = yield* makeProviderInstanceRegistry<ClaudeDriverEnv>({
+        drivers: [ClaudeDriver],
+        configMap: { [gmailId]: login("token-gmail"), [workId]: login("token-work") },
+      });
+      const gmail = (yield* registry.getInstance(gmailId))!;
+      const work = (yield* registry.getInstance(workId))!;
+
+      // Several refreshes, in turn, as the sidecar asks for them.
+      for (let round = 0; round < 3; round++) {
+        yield* gmail.invalidateCaches ?? Effect.void;
+        yield* work.invalidateCaches ?? Effect.void;
+        const gmailSnapshot = yield* gmail.snapshot.refresh;
+        const workSnapshot = yield* work.snapshot.refresh;
+        expect(gmailSnapshot.usageLimits?.windows[0]?.usedPercent).toBe(scenario.gmailSees);
+        expect(workSnapshot.usageLimits?.windows[0]?.usedPercent).toBe(scenario.workSees);
+      }
+
+      const usageFolder = path.join(fixtures.claudeHomePath, "aiva-usage");
+      expect(new Set(probeFolders)).toEqual(
+        new Set(
+          scenario.aivaJson
+            ? [path.join(usageFolder, "claude_gmail"), path.join(usageFolder, "claude_work")]
+            : [fixtures.claudeHomePath],
+        ),
+      );
+      expect(yield* fs.exists(usageFolder)).toBe(scenario.aivaJson);
+      if (scenario.aivaJson) {
+        const info = yield* fs.stat(path.join(usageFolder, "claude_work"));
+        expect(info.mode & 0o777).toBe(0o700);
+      }
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
   const redeemClaudeReset = (claim: { result: string; usageFailsAfterClaim: boolean }) =>
