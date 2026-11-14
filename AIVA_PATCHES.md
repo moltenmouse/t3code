@@ -1,6 +1,6 @@
 # Aiva patches on t3
 
-This fork is upstream [pingdotgg/t3code](https://github.com/pingdotgg/t3code) at a **stable release tag** (see `AIVA_BASE`), plus a small queue of commits titled `aiva: …`. The plan and the rules are in moltenmouse/aiva-core `docs/research/t3-fork-plan.md`.
+This fork is upstream [pingdotgg/t3code](https://github.com/pingdotgg/t3code) at a **stable release tag** (see `AIVA_BASE`), or at upstream `main` when we need its fixes sooner (since aiva.16: see [Base](#base-upstream-main-since-aiva16)), plus a small queue of commits titled `aiva: …`. The plan and the rules are in moltenmouse/aiva-core `docs/research/t3-fork-plan.md`.
 
 **Rules:**
 
@@ -12,10 +12,29 @@ This fork is upstream [pingdotgg/t3code](https://github.com/pingdotgg/t3code) at
 
 ## Branches and releases
 
-- `aiva`: the default branch, rebased onto each new upstream stable tag.
+- `aiva`: the default branch, rebased onto each new upstream stable tag (or upstream `main`, as for aiva.16). A rebase is pushed as `aiva-rebase-<date>` first and moves `aiva` only after review.
 - Releases are `v<upstream version>-aiva.<n>`, e.g. `v0.1.7-aiva.1`. Each has Linux x64 and arm64 CLI archives, `SHA256SUMS`, and the update feed files `latest-linux.yml` and `latest-linux-arm64.yml`.
 - Machines install and update from `https://cloud.aiva.gg/t3/releases`, set as `T3CODE_RELEASE_BASE_URL`, plus the managed policy's update `feedUrl`. The hub serves the feed files and redirects archive downloads to these GitHub releases.
 - Upstream's own workflows are disabled in this repository. Ours are `aiva-*.yml`.
+
+## Base: upstream main (since aiva.16)
+
+On 14 Nov 2026 (AIV-577) the queue was rebased from `322f6544` (v0.1.7, 3 Nov) onto upstream `main` at `35d01dc2` (14 Nov), 1,868 upstream commits later and past v0.1.9, for upstream's server speed and reliability work. Branch `aiva-rebase-2026-11-14`.
+
+- `AIVA_BASE` stays `v0.1.7`, so releases go on as `0.1.7-aiva.<n>` and machines' updates keep their order. Upstream's own version on this base is 0.1.9; `t3 --version` reports the release version we build it as.
+- `aiva-rebase.yml` compares `AIVA_BASE` with upstream's newest stable tag, so it now sees v0.1.9 as newer. Its `aiva-on-v0.1.9` branch would be a step back from this base: don't promote it.
+- No patch was dropped: upstream replaced none of their purposes. What changed in each:
+  - **P1, P2, P4, P6, P7, P10, P12, P14:** unchanged.
+  - **P3:** unchanged code. Upstream reworded its orchestration text (for example "As a subagent or child", "Asked only to schedule: …", and a secrets bullet with a sudo recipe), so the tests quote the new words. With the sidecar's hidden tools, the trimmed text is the same in substance as on v0.1.7.
+  - **P5:** unchanged. Upstream now checks that a worktree child's base commit is in the project checkout; P5's options are applied after that check.
+  - **P8:** unchanged. Upstream's MCP tools now refuse arguments they don't declare (#26721); `forkContext` is declared.
+  - **P9:** unchanged. Upstream still sends the asks that bypass can't skip to the permission callback.
+  - **P11:** the call's thread settings are still what the thread's next turn would get, which on this base means reading the user's `model_reasoning_summary` first (`config/read`, as upstream's `startNativeTurn` does). Upstream's turns send that summary, or `auto`, instead of `detailed`. The voice hand-off check moved inside `startTurn`'s `Effect.gen` (upstream's lint), and `AivaVoiceError` is a `Schema.TaggedError`.
+  - **P15:** unchanged behaviour. The note about cancelled work goes before the user's text, inside upstream's effort prefix; upstream's offset for skill mentions in inline context still counts from the end.
+  - **P16:** kept. Upstream added sends that start a fresh provider session (`freshContext` on a send, #30323) and `/clear` (#30325). Those apply to the next send. `thread.context.reset` is a command the Aiva apps send on its own, refused or done at once, so they don't replace it. P16 works as before, on the same provider-thread row. Its test now also checks that the fresh session gets no summary of the turns before the reset. A possible follow-up is to reset by making the next send a fresh-context run, so that P16 shares upstream's context boundary.
+  - **P17:** unchanged. Upstream added thread modes beside it (`threadMode`: `new_thread`, `continue`, `fresh_session`). Its test stubs the destination-thread check that upstream added.
+  - **Agent context budget:** the MCP tool list is 50,082 bytes with our fields (upstream's own budget is 49,806).
+- Upstream changes the Aiva sidecar and apps must follow are listed in aiva-core `docs/research/t3-fork-plan.md` (AIV-577).
 
 ## Workflows
 
