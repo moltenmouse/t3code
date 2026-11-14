@@ -60,6 +60,7 @@ import {
 } from "./ClaudeHome.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { makeClaudeMaintenanceResolution } from "./ClaudeMaintenance.ts";
+import { aivaClaudeUsageProbe } from "../../aiva/claudeUsageHome.ts";
 const decodeClaudeSettings = Schema.decodeSync(ClaudeSettings);
 
 const DRIVER_KIND = ProviderDriverKind.make("claudeAgent");
@@ -141,6 +142,14 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
         ? configDir
         : undefined,
     );
+    // P18: the probe reads usage in the instance's own folder, not the shared one.
+    const usageProbe = aivaClaudeUsageProbe({
+      instanceId,
+      config: effectiveConfig,
+      sharedHome: configDir,
+      accountConfigPath,
+      environment: processEnv,
+    });
     const stampIdentity = withInstanceIdentity({
       instanceId,
       driverKind: DRIVER_KIND,
@@ -206,9 +215,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
     const lastGoodCapabilities = yield* Ref.make<ClaudeCapabilitiesProbe | undefined>(undefined);
     const capabilitiesProbeCache = yield* Cache.makeWith(
       () =>
-        probeClaudeCapabilities(effectiveConfig, processEnv, stateDir).pipe(
+        Effect.sync(usageProbe.prepare).pipe(
+          Effect.andThen(probeClaudeCapabilities(usageProbe.config, processEnv, stateDir)),
           Effect.flatMap((capabilities) =>
-            ClaudeResetCredits.readClaudeOrganizationId(accountConfigPath).pipe(
+            ClaudeResetCredits.readClaudeOrganizationId(usageProbe.accountConfigPath).pipe(
               Effect.map((workspaceId) => ({
                 _tag: "fresh" as const,
                 capabilities:
@@ -227,7 +237,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
               Effect.flatMap((capabilities) =>
                 capabilities === undefined
                   ? Effect.fail(error)
-                  : ClaudeResetCredits.readClaudeOrganizationId(accountConfigPath).pipe(
+                  : ClaudeResetCredits.readClaudeOrganizationId(usageProbe.accountConfigPath).pipe(
                       Effect.flatMap((workspaceId) =>
                         workspaceId === capabilities.workspaceId
                           ? Effect.succeed({
