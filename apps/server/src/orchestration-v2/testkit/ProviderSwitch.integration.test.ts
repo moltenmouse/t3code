@@ -2554,6 +2554,198 @@ describe("orchestration v2 provider switching", () => {
     }),
   );
 
+  // aiva P19 (AIV-595): an automatic notice queued on an account that then hit its usage
+  // limit sat at the head of the queue until that limit's reset, days away, while the thread
+  // ran on other accounts, and every message queued after it waited too.
+  it.live("delivers messages queued on a limited account once the thread switches accounts", () =>
+    Effect.gen(function* () {
+      const cwd = yield* checkpointWorkspace("queued-limited-account-switch");
+      const capturedTurns = yield* Ref.make<ReadonlyArray<CapturedTurn>>([]);
+      const started = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const limitedSelection: ModelSelection = {
+        ...CODEX_MODEL_SELECTION,
+        instanceId: ProviderInstanceId.make("codex-limited"),
+      };
+      const nextSelection: ModelSelection = {
+        ...CODEX_MODEL_SELECTION,
+        instanceId: ProviderInstanceId.make("codex-next"),
+      };
+      const resetAt = DateTime.formatIso(DateTime.add(yield* DateTime.now, { hours: 30 }));
+      const adapters = [
+        makeTestAdapter({
+          instanceId: limitedSelection.instanceId,
+          driver: CODEX_DRIVER,
+          capabilities: CodexProviderCapabilitiesV2,
+          modelSelection: limitedSelection,
+          responseByRunOrdinal: {},
+          capturedTurns,
+          holdFirstTurn: started,
+          releaseFirstTurn: release,
+          failedRunOrdinals: new Set([1]),
+          failure: makeProviderFailure({
+            message: "You've hit your usage limit.",
+            code: "usage_limit_exceeded",
+            class: "usage_limit",
+            retryable: true,
+            resetAt,
+          }),
+        }),
+        makeTestAdapter({
+          instanceId: nextSelection.instanceId,
+          driver: CODEX_DRIVER,
+          capabilities: CodexProviderCapabilitiesV2,
+          modelSelection: nextSelection,
+          responseByRunOrdinal: {},
+          capturedTurns,
+        }),
+      ];
+      const layerRegistry = Layer.succeed(
+        ProviderAdapterRegistry.ProviderAdapterRegistryV2,
+        ProviderAdapterRegistry.ProviderAdapterRegistryV2.of({
+          get: (instanceId) => {
+            const adapter = adapters.find((candidate) => candidate.instanceId === instanceId);
+            return adapter === undefined
+              ? Effect.fail(
+                  new ProviderAdapterRegistry.ProviderAdapterRegistryLookupError({ instanceId }),
+                )
+              : Effect.succeed(adapter);
+          },
+          list: () => Effect.succeed(adapters.map((adapter) => adapter.instanceId)),
+          getMetadata: (instanceId) =>
+            adapters.some((candidate) => candidate.instanceId === instanceId)
+              ? Effect.succeed({
+                  driver: CODEX_DRIVER,
+                  continuationKey: "codex:shared-native-account-history",
+                  enabled: true,
+                  capabilities: CodexProviderCapabilitiesV2,
+                })
+              : Effect.fail(
+                  new ProviderAdapterRegistry.ProviderAdapterRegistryLookupError({ instanceId }),
+                ),
+        }),
+      );
+      const limitedThreadId = ThreadId.make("thread:queued-limited-account-switch");
+      const agentNotice = (id: string, text: string): OrchestrationV2Command => ({
+        type: "message.dispatch",
+        createdBy: "agent",
+        creationSource: "mcp",
+        commandId: CommandId.make(`command:queued-limited-account-switch:${id}`),
+        threadId: limitedThreadId,
+        messageId: MessageId.make(`message:queued-limited-account-switch:${id}`),
+        text,
+        attachments: [],
+        dispatchMode: { type: "start_immediately" },
+        deliveryIntent: "auto",
+      });
+      const { held, delivered } = yield* Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make("command:queued-limited-account-switch:create"),
+          threadId: limitedThreadId,
+          projectId: ProjectId.make("project:queued-limited-account-switch"),
+          title: "Queued limited account switch",
+          modelSelection: limitedSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: cwd,
+        });
+        yield* orchestrator.dispatch(agentNotice("first", "Switched accounts. Carry on."));
+        yield* Deferred.await(started);
+        // The second notice arrives while the first turn still runs, so it queues on that account.
+        yield* orchestrator.dispatch(agentNotice("second", "Switched accounts again."));
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make("command:queued-limited-account-switch:user"),
+          threadId: limitedThreadId,
+          messageId: MessageId.make("message:queued-limited-account-switch:user"),
+          text: "The user's own message",
+          attachments: [],
+          dispatchMode: { type: "queue_after_active" },
+        });
+        yield* Deferred.succeed(release, undefined);
+        // The first turn fails on the account's usage limit; the queue waits for its reset.
+        yield* orchestrator.streamStoredEvents.pipe(
+          Stream.filter(
+            (event) =>
+              event.event.type === "run.updated" &&
+              event.event.payload.ordinal === 1 &&
+              event.event.payload.status === "failed",
+          ),
+          Stream.runHead,
+        );
+        yield* worker.drain();
+        const held = yield* orchestrator.getThreadProjection(limitedThreadId);
+        // The usage-limit switch moves the thread to another account (t3_thread_configure).
+        yield* orchestrator.dispatch({
+          type: "thread.model-selection.set",
+          commandId: CommandId.make("command:queued-limited-account-switch:switch"),
+          threadId: limitedThreadId,
+          modelSelection: nextSelection,
+        });
+        const delivered = yield* waitForIdle(limitedThreadId).pipe(
+          Effect.timeoutOrElse({
+            duration: "20 seconds",
+            orElse: () => orchestrator.getThreadProjection(limitedThreadId),
+          }),
+        );
+        yield* worker.drain();
+        return { held, delivered };
+      }).pipe(
+        Effect.provide(
+          ProviderReplayHarness.layerWithRegistry(
+            {
+              name: "queued-limited-account-switch",
+              runtimePolicyOverride: {
+                cwd,
+                approvalPolicy: "never",
+                sandboxPolicy: {
+                  type: "readOnly",
+                  access: { type: "fullAccess" },
+                  networkAccess: false,
+                },
+              },
+            },
+            layerRegistry,
+          ),
+        ),
+      );
+      assert.deepEqual(
+        held.runs.map((run) => [run.providerInstanceId, run.status]),
+        [
+          [limitedSelection.instanceId, "failed"],
+          [limitedSelection.instanceId, "queued"],
+          [limitedSelection.instanceId, "queued"],
+        ],
+      );
+      assert.deepEqual(
+        delivered.runs
+          .toSorted((left, right) => left.ordinal - right.ordinal)
+          .map((run) => [run.providerInstanceId, run.status]),
+        [
+          [limitedSelection.instanceId, "failed"],
+          [nextSelection.instanceId, "completed"],
+          [nextSelection.instanceId, "completed"],
+        ],
+      );
+      assert.deepEqual(
+        (yield* Ref.get(capturedTurns)).map((turn) => [turn.modelSelection.instanceId, turn.text]),
+        [
+          [limitedSelection.instanceId, "Switched accounts. Carry on."],
+          [nextSelection.instanceId, "Switched accounts again."],
+          [nextSelection.instanceId, "The user's own message"],
+        ],
+      );
+    }),
+  );
+
   it.live("finishes earlier queued Codex turns before handing context to queued Claude", () =>
     Effect.gen(function* () {
       const cwd = yield* checkpointWorkspace("queued-provider-switch");
