@@ -91,6 +91,7 @@ import {
 } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
+import { aivaCreatedAt, aivaHistoryEvents, takeAivaImportExtras } from "../aiva/importHistory.ts";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
@@ -3672,6 +3673,17 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
 
     const now = yield* DateTime.now;
     const emitEvent = emit(events, command);
+    // P20: a moved session's age, parent and recent history.
+    const aivaExtras =
+      command.importedNativeThread === undefined ? null : takeAivaImportExtras(command.threadId);
+    const aivaParent =
+      aivaExtras?.parentThreadId == null
+        ? null
+        : yield* projectionStore.getThread(ThreadId.make(aivaExtras.parentThreadId)).pipe(
+            Effect.map((parent) => (parent.deletedAt === null ? parent : null)),
+            Effect.orElseSucceed(() => null),
+          );
+    const createdAt = aivaCreatedAt(aivaExtras, now);
     const thread: OrchestrationV2AppThread = {
       createdBy: command.createdBy,
       creationSource: command.creationSource,
@@ -3692,12 +3704,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ? {}
         : { delegatedFrom: command.delegatedFrom }),
       lineage: {
-        parentThreadId: null,
+        parentThreadId: aivaParent?.id ?? null,
         relationshipToParent: null,
-        rootThreadId: command.threadId,
+        rootThreadId: aivaParent?.lineage.rootThreadId ?? command.threadId,
       },
       forkedFrom: null,
-      createdAt: now,
+      createdAt,
       updatedAt: now,
       archivedAt: null,
       settledOverride: null,
@@ -3715,6 +3727,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       occurredAt: now,
       payload: thread,
     });
+    if (aivaExtras !== null && aivaExtras.history.length > 0) {
+      const history = aivaHistoryEvents(command.threadId, aivaExtras, createdAt);
+      yield* Ref.update(events, (existing) => [...existing, ...history]);
+    }
     if (command.importedNativeThread !== undefined) {
       yield* emitEvent({
         type: "provider-thread.updated",

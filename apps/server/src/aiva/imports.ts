@@ -2,16 +2,20 @@
 /**
  * P7: a new thread continues a native conversation (Claude Code session or Codex thread) named in
  * `<aiva.json's folder>/aiva-imports/<clientRequestId>.json` = `{ "nativeId": "…" }`, beside
- * `t3_thread_launch` (no contract change). Without a file, the launch is unchanged.
+ * `t3_thread_launch` (no contract change). Without a file, the launch is unchanged. P20 adds
+ * optional fields (see importHistory.ts).
  */
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 
+import { type AivaImportExtras, parseAivaImportExtras } from "./importHistory.ts";
 import { aivaSettingsPath } from "./settings.ts";
 
 export interface AivaNativeImport {
   readonly nativeId: string;
   readonly title: string | null;
+  /** P20: the moved session's start, parent and recent history, when the file names them. */
+  readonly extras?: AivaImportExtras;
 }
 
 const CLIENT_REQUEST_ID = /^[A-Za-z0-9_.:-]{1,200}$/;
@@ -41,5 +45,8 @@ export function takeAivaNativeImport(
     typeof input.title === "string" && input.title.trim() !== ""
       ? input.title.trim().slice(0, 200)
       : null;
-  return { nativeId: input.nativeId, title };
+  const extras = parseAivaImportExtras(input);
+  return extras === null
+    ? { nativeId: input.nativeId, title }
+    : { nativeId: input.nativeId, title, extras };
 }

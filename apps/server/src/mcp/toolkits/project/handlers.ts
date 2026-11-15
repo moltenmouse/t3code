@@ -14,6 +14,7 @@ import * as Schema from "effect/Schema";
 import { OrchestratorRuntimeModeAboveCeilingError } from "../../../orchestration-v2/Orchestrator.ts";
 import * as ThreadLaunch from "../../../orchestration-v2/ThreadLaunchService.ts";
 import { takeAivaNativeImport } from "../../../aiva/imports.ts";
+import { stageAivaImportExtras, takeAivaImportExtras } from "../../../aiva/importHistory.ts";
 import * as ThreadMessageIntake from "../../../orchestration-v2/ThreadMessageIntake.ts";
 import * as Claims from "../../../orchestration-v2/AttachmentClaims.ts";
 import * as Project from "../../../project/ProjectService.ts";
@@ -263,6 +264,9 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
             : (yield* (yield* ProviderRegistry.ProviderRegistry).getProviders).find(
                 (provider) => provider.instanceId === modelSelection.instanceId,
               )?.driver;
+        // P20: the moved session's age, parent and recent history, for this thread's creation.
+        if (aivaImport?.extras !== undefined && aivaImportDriver !== undefined)
+          stageAivaImportExtras(threadId, aivaImport.extras);
         const result = yield* ThreadMessageIntake.launchThread({
           commandId,
           threadId,
@@ -300,6 +304,8 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
                 },
               }),
         }).pipe(
+          // Whatever was staged and not taken (a replay, a refusal) goes.
+          Effect.ensuring(Effect.sync(() => takeAivaImportExtras(threadId))),
           Effect.mapError((error) => {
             if (error._tag === "AttachmentClaimError") {
               return new OrchestratorMcpFailure({
