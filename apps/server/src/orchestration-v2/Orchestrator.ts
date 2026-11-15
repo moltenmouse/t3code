@@ -7655,7 +7655,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ...(command.senderThreadId === undefined ? {} : { senderThreadId: command.senderThreadId }),
         ...(command.linkedSender === undefined ? {} : { linkedSender: command.linkedSender }),
         ...(command.idleCompaction === undefined ? {} : { idleCompaction: command.idleCompaction }),
-        ...(command.scheduledTaskId !== undefined && command.modelSelection === undefined
+        // aiva P19: a queued message that picked no model runs on whatever the thread is on
+        // when its turn comes, like an unpinned scheduled delivery. Frozen on the thread's pick
+        // at queue time, it would wait out that account's usage limit after the thread had moved
+        // to another account, holding up everything queued behind it.
+        ...(command.modelSelection === undefined &&
+        (command.scheduledTaskId !== undefined ||
+          (steerWhenReadyRunId === undefined &&
+            queuedRunStop === undefined &&
+            delegatedCompletion === undefined &&
+            command.notification === undefined))
           ? { followsThreadSelection: true as const }
           : {}),
         id: command.messageId,
@@ -15519,6 +15528,23 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           userStarted: command.type !== "thread.runtime-mode.set",
           ...(command.type === "queued-run.start" ? { queuedRunId: command.runId } : {}),
         }),
+      );
+    }
+    // aiva P19: a queue waiting on the instance the thread just left (its usage limit)
+    // starts on the new one now, ahead of anything sent after the switch. Nothing else
+    // would start it until some later turn ended.
+    if (
+      (command.type === "thread.model-selection.set" || command.type === "provider.switch") &&
+      committed.committed &&
+      committed.storedEvents.some(({ event }) => event.type === "thread.provider-switched")
+    ) {
+      yield* startNextQueuedRun(command.threadId).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("Failed to start the queue after a provider switch", {
+            threadId: command.threadId,
+            cause,
+          }),
+        ),
       );
     }
     if (
