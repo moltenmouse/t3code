@@ -1,6 +1,7 @@
 import * as DocumentText from "../../provider/DocumentText.ts";
 import { aivaClaudeQueryOptions } from "../../aiva/threadConfig.ts";
 import { aivaFullAccessApproves } from "../../aiva/approvals.ts";
+import { aivaSendToUserInstructions } from "../../aiva/sendToUserInstructions.ts";
 import {
   aivaClaudeInterruptRestart,
   aivaClaudeTokenStale,
@@ -2172,7 +2173,7 @@ export function makeClaudeQueryOptions(input: {
             ? ""
             : T3_CODE_ORCHESTRATION_INSTRUCTIONS +
               CLAUDE_BACKGROUND_WAIT_INSTRUCTIONS +
-              CLAUDE_SEND_TO_USER_INSTRUCTIONS +
+              aivaSendToUserInstructions(CLAUDE_SEND_TO_USER_INSTRUCTIONS) +
               (deviceInstructions
                 ? `\n${T3_CODE_DEVICE_TOOL_INSTRUCTIONS_WITH_TOOL_SEARCH}\n`
                 : "")),
