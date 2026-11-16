@@ -140,6 +140,7 @@ function commandThreadIds(command: OrchestrationV2Command): ReadonlyArray<Thread
     case "thread.create":
     case "thread.stop":
     case "thread.context.reset":
+    case "thread.mcp.reset":
     case "thread.archive":
     case "thread.unarchive":
     case "thread.delete":
