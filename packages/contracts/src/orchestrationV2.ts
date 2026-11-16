@@ -3066,6 +3066,16 @@ export const OrchestrationV2Command = Schema.Union([
     commandId: CommandId,
     threadId: ThreadId,
   }),
+  /**
+   * Aiva P21: reconnect the thread's MCP servers (old Aiva's "Reset MCP"): its live provider sessions detach and its
+   * native conversations stay, so the next turn resumes them with fresh MCP connections. A busy thread is never
+   * interrupted: the reset waits for its next turn.
+   */
+  Schema.Struct({
+    type: Schema.Literal("thread.mcp.reset"),
+    commandId: CommandId,
+    threadId: ThreadId,
+  }),
   Schema.Struct({
     type: Schema.Literal("thread.stop"),
     commandId: CommandId,
