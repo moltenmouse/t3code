@@ -92,6 +92,7 @@ import {
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import { aivaCreatedAt, aivaHistoryEvents, takeAivaImportExtras } from "../aiva/importHistory.ts";
+import { AIVA_MCP_RESET_REASON, aivaClearOwedMcpReset, aivaOweMcpReset } from "../aiva/mcpReset.ts";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
@@ -677,6 +678,7 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "thread.interrupt.unresponsive":
     case "thread.stop":
     case "thread.context.reset":
+    case "thread.mcp.reset":
     case "provider.switch":
       return command.threadId;
     case "delegated_task.request":
@@ -5526,6 +5528,82 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }
     },
   );
+
+  // Aiva P21: old Aiva's "Reset MCP". The thread's live provider sessions detach and its native threads stay, so
+  // the next turn resumes the same conversation in a session that connects its MCP servers afresh. A busy thread
+  // (a run active or queued, a request waiting, background work running) is never interrupted: the reset is owed
+  // and settled just before its next turn opens its session (aiva/mcpReset.ts).
+  const dispatchThreadMcpReset = Effect.fn("orchestrationV2.dispatch.threadMcpReset")(function* (
+    command: Extract<OrchestrationV2Command, { readonly type: "thread.mcp.reset" }>,
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+    effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
+  ) {
+    const projection = yield* projectionStore
+      .getThreadRecords(
+        command.threadId,
+        ["runs", "runtimeRequests", "providerThreads", "providerSessions"],
+        { turnItemTypes: [] },
+      )
+      .pipe(
+        Effect.mapError(
+          (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
+        ),
+      );
+    if (projection.thread.deletedAt !== null) {
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: `Thread ${command.threadId} is deleted.`,
+      });
+    }
+    // A provider's own native sub-agent runs in its parent's native session: reset the parent instead.
+    if (isProviderNativeSubagentThread(projection.thread)) {
+      return yield* new OrchestratorSubagentThreadReadOnlyError({
+        commandId: command.commandId,
+        threadId: command.threadId,
+      });
+    }
+    const live = projection.providerSessions.filter(
+      (session) => session.status !== "stopped" && session.status !== "error",
+    );
+    let busy = threadHasUnfinishedWork(projection);
+    for (const session of live) {
+      if (busy) break;
+      busy = yield* sessionHasBackgroundWork(session, projection.providerThreads);
+    }
+    if (busy) {
+      aivaOweMcpReset(command.threadId);
+      return;
+    }
+    aivaClearOwedMcpReset(command.threadId);
+    const now = yield* DateTime.now;
+    for (const session of live) {
+      yield* emit(
+        events,
+        command,
+      )({
+        type: "provider-session.detached",
+        threadId: command.threadId,
+        driver: session.driver,
+        providerInstanceId: session.providerInstanceId,
+        occurredAt: now,
+        payload: { providerSessionId: session.id, detachedAt: now, reason: AIVA_MCP_RESET_REASON },
+      });
+      yield* Ref.update(effects, (existing) => [
+        ...existing,
+        {
+          id: `effect:${command.commandId}:provider-session.detach:${session.id}`,
+          commandId: command.commandId,
+          threadId: command.threadId,
+          request: {
+            type: "provider-session.detach",
+            providerSessionId: session.id,
+            detail: AIVA_MCP_RESET_REASON,
+          },
+        } satisfies PendingOrchestrationEffectV2,
+      ]);
+    }
+  });
 
   const dispatchThreadProjectAdoptFolder = Effect.fn(
     "orchestrationV2.dispatch.threadProjectAdoptFolder",
@@ -15028,6 +15106,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       case "thread.context.reset":
         yield* dispatchThreadContextReset(command, events, effects);
         break;
+      case "thread.mcp.reset":
+        yield* dispatchThreadMcpReset(command, events, effects);
+        break;
       case "thread.project.adopt-folder":
         yield* dispatchThreadProjectAdoptFolder(command, events);
         break;
@@ -15368,6 +15449,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           command.type === "subagent.stop" ||
           // Aiva P16: a thread whose context is already fresh (never ran, or reset since) has nothing to reset.
           command.type === "thread.context.reset" ||
+          // Aiva P21: a reset with no live session, or one a busy thread owes its next turn, emits nothing.
+          command.type === "thread.mcp.reset" ||
           // Closing a share again, or after it ended, is not an error.
           command.type === "thread.guest-share.close" ||
           (command.type === "thread.delete" && command.onlyIfUnused === true),

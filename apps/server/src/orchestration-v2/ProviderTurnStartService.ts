@@ -55,6 +55,7 @@ import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter"
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
+import { aivaSettleOwedMcpReset } from "../aiva/mcpReset.ts";
 import {
   ContextHandoffBackgroundWorkError,
   knownProviderFailureMessage,
@@ -706,6 +707,20 @@ export const layer: Layer.Layer<
         run,
         checkpointScope,
       });
+      // Aiva P21: a Reset MCP asked for while the thread was busy reconnects its servers before this turn.
+      yield* aivaSettleOwedMcpReset({
+        providerSessions,
+        threadId: projection.thread.id,
+        providerSessionId,
+        providerThreads: projection.providerThreads,
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("aiva.mcp-reset.settle-failed", {
+            threadId: projection.thread.id,
+            cause,
+          }),
+        ),
+      );
       const sessionResult = yield* Effect.result(
         providerSessions.open({
           threadId: projection.thread.id,
