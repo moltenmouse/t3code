@@ -943,23 +943,38 @@ function nextQueuedRun(
   return queuedRunsInDeliveryOrder(projection).find((run) => run.queueHeld !== true);
 }
 
+// aiva P23: MCP `t3_thread_send` has never taken a model, so its messages queued before P19 marked
+// them (`message:mcp:<namespace>:thread-send:<key>`, each part URI-encoded) picked none either.
+function isMcpThreadSendMessageId(
+  id: OrchestrationV2ConversationMessage["id"] | undefined,
+): boolean {
+  const parts = id?.split(":");
+  return (
+    parts?.length === 5 &&
+    parts[0] === "message" &&
+    parts[1] === "mcp" &&
+    parts[3] === "thread-send"
+  );
+}
+
 // Delegated completions, monitor notifications and unpinned scheduled deliveries never choose a
 // model, so a queued one runs on the thread's current pick rather than the one frozen at queue time.
 function followsCurrentConversation(
   message:
-    | Pick<
+    | (Pick<
         OrchestrationV2ConversationMessage,
         | "createdBy"
         | "creationSource"
         | "notification"
         | "delegatedCompletion"
         | "followsThreadSelection"
-      >
+      > & { readonly id?: OrchestrationV2ConversationMessage["id"] })
     | undefined,
 ): boolean {
   return (
     message?.delegatedCompletion !== undefined ||
     message?.followsThreadSelection === true ||
+    isMcpThreadSendMessageId(message?.id) ||
     (message?.notification?.source.kind === "monitor" && !isBufferedProviderNotification(message))
   );
 }

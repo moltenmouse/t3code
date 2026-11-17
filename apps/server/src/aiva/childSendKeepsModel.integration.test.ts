@@ -4,6 +4,7 @@ import { assert, it } from "@effect/vitest";
 import {
   CommandId,
   EnvironmentId,
+  EventId,
   MessageId,
   ProjectId,
   ProviderDriverKind,
@@ -24,6 +25,7 @@ import * as Stream from "effect/Stream";
 import { ClaudeProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
 import * as CommandReceiptStore from "../orchestration-v2/CommandReceiptStore.ts";
 import * as EffectWorker from "../orchestration-v2/EffectWorker.ts";
+import * as EventSink from "../orchestration-v2/EventSink.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
@@ -56,11 +58,10 @@ const personSelection: ModelSelection = {
   options: [{ id: "effort", value: "high" }],
 };
 
-// aiva P23 (AIV-610): the launch model applies when a sub-session is created and never again.
-// However its parent's later message reaches it, it runs on what the sub-session is set to now.
-// "steer-race": an MCP `steer` that saw the turn running but reached the orchestrator before the
-// provider reported it: it waits as a queued run and steers once the turn is ready.
-type Step = "switch" | "queue" | "auto" | "steer-race";
+// aiva P23 (AIV-610): however a parent's message reaches a sub-session, it runs on what the
+// sub-session is set to now. "steer-race": an MCP steer that waits for the turn to be ready.
+// "legacy-queue": queued as before P19, frozen with no mark (daedalus, 15 Nov).
+type Step = "switch" | "queue" | "auto" | "steer-race" | "legacy-queue";
 it.effect.each<{
   readonly when: "starting" | "running" | "idle";
   readonly steps: ReadonlyArray<Step>;
@@ -70,6 +71,8 @@ it.effect.each<{
   // Queued behind the running turn, before and after the person's switch (AIV-610 on aiva.17).
   { when: "running", steps: ["queue", "switch"] },
   { when: "running", steps: ["queue", "switch", "queue"] },
+  { when: "running", steps: ["legacy-queue", "switch"] },
+  { when: "running", steps: ["legacy-queue", "legacy-queue", "switch", "queue"] },
   // Steered into the running turn, or sent to a finished sub-session.
   { when: "running", steps: ["switch", "auto"] },
   { when: "idle", steps: ["switch", "auto"] },
@@ -337,6 +340,34 @@ it.effect.each<{
               dispatchMode: { type: "steer_active", targetRunId: child.runs[0]!.id },
               createdBy: "agent",
               creationSource: "mcp",
+            });
+          } else if (step === "legacy-queue") {
+            sent += 1;
+            newTurns += 1;
+            const { messageId } = yield* service.sendToThread(scope, {
+              threadId: childThreadId,
+              message: `Parent's message ${sent}`,
+              mode: "queue",
+              clientRequestId: `parent-sends-${sent}`,
+            });
+            const child = yield* orchestrator.getThreadProjection(childThreadId);
+            const { followsThreadSelection: _mark, ...unmarked } = child.messages.find(
+              (message) => message.id === messageId,
+            )!;
+            const run = child.runs.find((candidate) => candidate.id === unmarked.runId)!;
+            assert.deepEqual(run.modelSelection, launchSelection);
+            yield* (yield* EventSink.EventSinkV2).write({
+              commandId: CommandId.make(`command:before-p19:${sent}`),
+              events: [
+                {
+                  id: EventId.make(`event:before-p19:${sent}`),
+                  type: "message.updated",
+                  threadId: childThreadId,
+                  runId: run.id,
+                  occurredAt: unmarked.updatedAt,
+                  payload: unmarked,
+                },
+              ],
             });
           } else {
             sent += 1;
