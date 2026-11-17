@@ -325,7 +325,10 @@ export const layerExecutor: Layer.Layer<
                         text: message.text,
                         ...(message.context ? { context: message.context } : {}),
                         attachments: message.attachments,
-                        ...(error.steerDeclined && effect.request.modelSelection !== undefined
+                        // aiva P23: the steer carried the thread's pick of the moment, not its own.
+                        ...(error.steerDeclined &&
+                        effect.request.modelSelection !== undefined &&
+                        message.followsThreadSelection !== true
                           ? { modelSelection: effect.request.modelSelection }
                           : message.delegatedCompletion === undefined
                             ? {}

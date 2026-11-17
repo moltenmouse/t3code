@@ -943,23 +943,38 @@ function nextQueuedRun(
   return queuedRunsInDeliveryOrder(projection).find((run) => run.queueHeld !== true);
 }
 
+// aiva P23: MCP `t3_thread_send` has never taken a model, so its messages queued before P19 marked
+// them (`message:mcp:<namespace>:thread-send:<key>`, each part URI-encoded) picked none either.
+function isMcpThreadSendMessageId(
+  id: OrchestrationV2ConversationMessage["id"] | undefined,
+): boolean {
+  const parts = id?.split(":");
+  return (
+    parts?.length === 5 &&
+    parts[0] === "message" &&
+    parts[1] === "mcp" &&
+    parts[3] === "thread-send"
+  );
+}
+
 // Delegated completions, monitor notifications and unpinned scheduled deliveries never choose a
 // model, so a queued one runs on the thread's current pick rather than the one frozen at queue time.
 function followsCurrentConversation(
   message:
-    | Pick<
+    | (Pick<
         OrchestrationV2ConversationMessage,
         | "createdBy"
         | "creationSource"
         | "notification"
         | "delegatedCompletion"
         | "followsThreadSelection"
-      >
+      > & { readonly id?: OrchestrationV2ConversationMessage["id"] })
     | undefined,
 ): boolean {
   return (
     message?.delegatedCompletion !== undefined ||
     message?.followsThreadSelection === true ||
+    isMcpThreadSendMessageId(message?.id) ||
     (message?.notification?.source.kind === "monitor" && !isBufferedProviderNotification(message))
   );
 }
@@ -6065,6 +6080,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     readonly idleCompaction?: OrchestrationV2ConversationMessage["idleCompaction"];
     readonly delegatedCompletion?: OrchestrationV2ConversationMessage["delegatedCompletion"];
     readonly notification?: OrchestrationV2ConversationMessage["notification"];
+    readonly followsThreadSelection?: true;
     readonly forceRestart: boolean;
   }) {
     const targetRun = input.projection.runs.find((candidate) => candidate.id === input.targetRunId);
@@ -6208,6 +6224,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ...(input.senderThreadId === undefined ? {} : { senderThreadId: input.senderThreadId }),
           ...(input.linkedSender === undefined ? {} : { linkedSender: input.linkedSender }),
           ...(input.idleCompaction === undefined ? {} : { idleCompaction: input.idleCompaction }),
+          ...(input.followsThreadSelection ? { followsThreadSelection: true as const } : {}),
           id: input.messageId,
           threadId: input.command.threadId,
           runId: messageInput.runId,
@@ -7457,6 +7474,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ...(command.senderThreadId === undefined ? {} : { senderThreadId: command.senderThreadId }),
         ...(command.linkedSender === undefined ? {} : { linkedSender: command.linkedSender }),
         ...(command.idleCompaction === undefined ? {} : { idleCompaction: command.idleCompaction }),
+        // aiva P23: a steer that picked no model keeps picking none if it runs as a turn later.
+        ...(command.modelSelection === undefined &&
+        delegatedCompletion === undefined &&
+        command.notification === undefined
+          ? { followsThreadSelection: true as const }
+          : {}),
         forceRestart: dispatchMode.type === "restart_active",
       });
       return;
@@ -7749,14 +7772,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ...(command.senderThreadId === undefined ? {} : { senderThreadId: command.senderThreadId }),
         ...(command.linkedSender === undefined ? {} : { linkedSender: command.linkedSender }),
         ...(command.idleCompaction === undefined ? {} : { idleCompaction: command.idleCompaction }),
-        // aiva P19: a queued message that picked no model runs on whatever the thread is on
-        // when its turn comes, like an unpinned scheduled delivery. Frozen on the thread's pick
-        // at queue time, it would wait out that account's usage limit after the thread had moved
-        // to another account, holding up everything queued behind it.
+        // aiva P19/P23: a queued message or deferred steer that picked no model runs on whatever
+        // the thread is on when its turn comes. Frozen at queue time, it waited out a limited
+        // account after the thread moved (P19), or put a sub-session a person had switched back
+        // on its delegation profile's model (P23).
         ...(command.modelSelection === undefined &&
         (command.scheduledTaskId !== undefined ||
-          (steerWhenReadyRunId === undefined &&
-            queuedRunStop === undefined &&
+          (queuedRunStop === undefined &&
             delegatedCompletion === undefined &&
             command.notification === undefined))
           ? { followsThreadSelection: true as const }
@@ -11545,6 +11567,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       ...(queuedMessage.idleCompaction === undefined
         ? {}
         : { idleCompaction: queuedMessage.idleCompaction }),
+      ...(queuedMessage.followsThreadSelection ? { followsThreadSelection: true as const } : {}),
       forceRestart: false,
     });
   });
