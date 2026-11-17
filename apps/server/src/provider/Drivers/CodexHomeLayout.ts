@@ -40,6 +40,15 @@ const REPLACEABLE_SHARED_RUNTIME_ENTRIES = new Set([
   ".sqlite-maintenance.lock",
 ]);
 
+/** aiva P24: the entries a shadow home keeps for itself, never shared. */
+export function isCodexShadowHomeOwnEntry(name: string): boolean {
+  return (
+    PRIVATE_ENTRY_NAMES.has(name) ||
+    SHADOW_LOCAL_ENTRY_NAMES.has(name) ||
+    REPLACEABLE_SHARED_RUNTIME_ENTRIES.has(name)
+  );
+}
+
 function resolveHomePath(path: Path.Path, home: string, value: string | undefined): string {
   const expanded =
     value && value.trim().length > 0 ? expandHomePath(value, home) : path.join(home, ".codex");

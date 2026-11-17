@@ -56,6 +56,7 @@ import {
   materializeCodexShadowHome,
   resolveCodexHomeLayout,
 } from "./CodexHomeLayout.ts";
+import { reconcileCodexShadowHome } from "../../aiva/codexShadowHome.ts";
 import { makeManagedCodexProvider } from "./CodexManagedProvider.ts";
 import { codexUsageReader } from "./codexUsage.ts";
 import * as CodexInstallation from "../CodexInstallation.ts";
@@ -203,6 +204,8 @@ export const CodexDriver: ProviderDriver<
       accentColor,
       continuationGroupKey: continuationIdentity.continuationKey,
     });
+    // aiva P24: before anything below can start this account's Codex.
+    yield* reconcileCodexShadowHome(homeLayout);
     yield* materializeCodexShadowHome(homeLayout).pipe(
       Effect.mapError(
         (cause) =>
