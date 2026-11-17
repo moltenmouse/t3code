@@ -121,6 +121,7 @@ import * as McpAppRequests from "./mcpApps/McpAppRequests.ts";
 import * as ProviderSessionManager from "./orchestration-v2/ProviderSessionManager.ts";
 import * as ThreadLaunchService from "./orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadMessageIntake from "./orchestration-v2/ThreadMessageIntake.ts";
+import { aivaRetryHeldDispatch } from "./aiva/retryFailedSetup.ts";
 import * as DocumentText from "./provider/DocumentText.ts";
 import * as ScheduledTasks from "./scheduledTasks/ScheduledTaskService.ts";
 import * as SecretRequests from "./secrets/SecretRequests.ts";
@@ -1984,6 +1985,14 @@ export const layerWsRpc = (
                   ).pipe(Effect.provide(intakeContext)),
                 )
                 .pipe(
+                  // aiva P27: a message held behind a failed worktree setup retries the setup.
+                  Effect.tap((result) =>
+                    aivaRetryHeldDispatch(
+                      { threads: threadManagement, launches: threadLaunch },
+                      command,
+                      result,
+                    ),
+                  ),
                   Effect.tap((result) =>
                     result.replayed ? Effect.void : recordClientCommandAnalytics(command),
                   ),

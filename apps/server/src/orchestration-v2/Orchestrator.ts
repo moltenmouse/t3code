@@ -205,6 +205,10 @@ import { planThreadDeletion } from "./ThreadDeletion.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ServerSettings from "../serverSettings.ts";
 import { aivaInteractionMode } from "../aiva/noPlanMode.ts";
+import {
+  aivaFailsMessagesAfterFailedSetup,
+  aivaLatestExecutedRun,
+} from "../aiva/retryFailedSetup.ts";
 
 const isMessageQuestionAnswer = Schema.is(
   Schema.Union([TrimmedNonEmptyString, Schema.NonEmptyArray(TrimmedNonEmptyString)]),
@@ -2136,6 +2140,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     threadId: ThreadId,
     cause: unknown,
     queuedRunId?: RunId,
+    message?: string,
   ) {
     const projection = yield* projectionStore.getThreadRecords(
       threadId,
@@ -2174,6 +2179,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         : cause;
     const failure = makeProviderFailure({
       cause: failureCause,
+      message,
       code: handoffUnsupported ? "context_handoff_unsupported" : "queued_start_failed",
       class: handoffUnsupported ? "validation_error" : "unknown",
     });
@@ -2456,6 +2462,19 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           failureClass !== "validation_error" &&
           failedRun?.providerInstanceId === queuedRun.providerInstanceId)
       ) {
+        // aiva P27: nothing waits behind a failed worktree setup; the next message retries it.
+        if (
+          worktreeMissing &&
+          failedRun?.status === "failed" &&
+          aivaFailsMessagesAfterFailedSetup()
+        ) {
+          const setupError = latestRootProviderFailure(failedRun, projection.turnItems)?.message;
+          for (const run of projection.runs) {
+            if (run.status === "queued")
+              yield* failQueuedRunStart(threadId, null, run.id, setupError);
+          }
+          return;
+        }
         const now = yield* DateTime.now;
         yield* writeSystemEvents(
           projection.runs
@@ -7498,7 +7517,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const activeRun = projection.runs.find(isActiveRun);
     // Messages after failed or stopped worktree setup must wait for a worktree,
     // rather than start in the project checkout.
-    const latestRun = latestExecutedRun(projection.runs);
+    // aiva P27: a message a failed setup failed never ran past it.
+    const latestRun = aivaLatestExecutedRun(projection.runs);
     const worktreeMissingRun =
       activeRun === undefined &&
       (dispatchMode.type === "queue_after_active" || dispatchMode.type === "start_immediately") &&
@@ -12184,7 +12204,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     });
     // Messages held when this preparation failed follow the run again. A hold
     // from a later run (a stop, say) is not this failure's to release.
-    const failureOwnsQueue = latestExecutedRun(projection.runs)?.id === state.run.id;
+    const failureOwnsQueue = aivaLatestExecutedRun(projection.runs)?.id === state.run.id; // aiva P27
     for (const run of projection.runs) {
       if (!failureOwnsQueue || run.status !== "queued" || run.queueHeld !== true) continue;
       yield* emitEvent({

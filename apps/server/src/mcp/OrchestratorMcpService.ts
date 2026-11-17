@@ -67,6 +67,7 @@ import {
   SECRET_REQUEST_UNSAVED_NOTE,
 } from "@t3tools/contracts";
 import { aivaDelegationWorkspace } from "../aiva/delegation.ts";
+import { aivaRetryFailedSetup } from "../aiva/retryFailedSetup.ts";
 import { getProviderOptionCurrentValue, withLegacyUltracodeEffort } from "@t3tools/shared/model";
 import { backgroundWorkHoldsCompletion } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 import { runRanAfter } from "@t3tools/shared/orchestrationV2ThreadError";
@@ -3368,6 +3369,23 @@ const make = Effect.gen(function* () {
                 ),
           ),
         );
+      // aiva P27: a message held behind a failed worktree setup retries the setup.
+      if (result.run.queueHeld === true) {
+        yield* aivaRetryFailedSetup(
+          { threads: threadManagement, launches: threadLaunch },
+          input.threadId,
+          stableCommandId({ scope, requestKey: key, operation: "thread-send" }),
+        ).pipe(
+          Effect.mapError((error) =>
+            isThreadManagementError(error)
+              ? threadManagementFailure(error)
+              : failure(
+                  "orchestration_error",
+                  `Unable to send to thread ${input.threadId}: ${userFacingDispatchErrorMessage(error) ?? errorMessage(error)}`,
+                ),
+          ),
+        );
+      }
       return {
         threadId: input.threadId,
         link: threadLinkFor(scope, input.threadId, target.thread.title),
