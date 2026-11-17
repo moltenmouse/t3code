@@ -204,6 +204,7 @@ import {
 import { planThreadDeletion } from "./ThreadDeletion.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ServerSettings from "../serverSettings.ts";
+import { aivaInteractionMode } from "../aiva/noPlanMode.ts";
 
 const isMessageQuestionAnswer = Schema.is(
   Schema.Union([TrimmedNonEmptyString, Schema.NonEmptyArray(TrimmedNonEmptyString)]),
@@ -3710,7 +3711,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       providerInstanceId: command.modelSelection.instanceId,
       modelSelection: command.modelSelection,
       runtimeMode: command.runtimeMode,
-      interactionMode: command.interactionMode,
+      interactionMode: aivaInteractionMode(command.interactionMode),
       branch: command.branch,
       worktreePath: command.worktreePath,
       activeProviderThreadId: null,
@@ -5051,7 +5052,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         case "thread.runtime-mode.set":
           return { ...thread, runtimeMode: command.runtimeMode, updatedAt: now };
         case "thread.interaction-mode.set":
-          return { ...thread, interactionMode: command.interactionMode, updatedAt: now };
+          return {
+            ...thread,
+            interactionMode: aivaInteractionMode(command.interactionMode),
+            updatedAt: now,
+          };
         case "thread.model-selection.set":
         case "provider.switch":
           return {
@@ -9519,7 +9524,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           creationSource: command.creationSource,
         }),
         runtimeMode: command.runtimeMode,
-        interactionMode: command.interactionMode,
+        interactionMode: aivaInteractionMode(command.interactionMode),
         ...(command.workspaceStrategy === undefined ? {} : { branch: null, worktreePath: null }),
       };
       const task: OrchestrationV2Subagent = {

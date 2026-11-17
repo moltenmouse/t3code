@@ -154,6 +154,8 @@ interface ClaudeQueryOptionsFields {
   readonly mcpServers?: Readonly<Record<string, unknown>>;
 }
 
+const CLAUDE_PLAN_MODE_TOOLS = ["EnterPlanMode", "ExitPlanMode"];
+
 /** Claude Agent SDK query options for one thread. */
 export function aivaClaudeQueryOptions<O extends ClaudeQueryOptionsFields>(
   threadId: string,
@@ -165,6 +167,8 @@ export function aivaClaudeQueryOptions<O extends ClaudeQueryOptionsFields>(
   const disallowed = [
     ...settings.disabledTools.map((tool) => `mcp__${T3_SERVER}__${tool}`),
     ...(native ? [] : ["Agent"]),
+    // P25: Claude can switch itself into plan mode, which brings back the approval cards.
+    ...CLAUDE_PLAN_MODE_TOOLS,
     ...settings.disabledNativeTools.claude,
   ];
   const servers = resolvedServers(

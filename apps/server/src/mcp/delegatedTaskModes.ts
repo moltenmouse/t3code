@@ -8,6 +8,7 @@ import {
   type RuntimeMode,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import { aivaInteractionMode } from "../aiva/noPlanMode.ts";
 
 /** How much a runtime mode allows, narrowest first. */
 export function runtimeModeRank(mode: RuntimeMode): number {
@@ -25,7 +26,7 @@ export function runtimeModeRank(mode: RuntimeMode): number {
 
 /** How much an interaction mode allows: plan, then default. */
 export function interactionModeRank(mode: ProviderInteractionMode): number {
-  return mode === "plan" ? 0 : 1;
+  return aivaInteractionMode(mode) === "plan" ? 0 : 1;
 }
 
 /**

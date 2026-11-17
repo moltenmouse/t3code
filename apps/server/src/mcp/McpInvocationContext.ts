@@ -14,6 +14,7 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import { formatThreadLink, hostedThreadLink } from "@t3tools/shared/threadLinks";
+import { aivaInteractionMode } from "../aiva/noPlanMode.ts";
 
 const ALL_MCP_CAPABILITIES = [
   "preview",
@@ -100,7 +101,8 @@ export const clientModeCeiling = (client: McpClientCaller | undefined): ClientMo
         ? asked.runtimeMode
         : approved.runtimeMode,
     interactionMode:
-      interactionModeRank[asked.interactionMode] < interactionModeRank[approved.interactionMode]
+      interactionModeRank[aivaInteractionMode(asked.interactionMode)] <
+      interactionModeRank[approved.interactionMode]
         ? asked.interactionMode
         : approved.interactionMode,
   };

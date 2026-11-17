@@ -518,7 +518,7 @@ const MAX_ARGUMENT_NAME_CHARS = 64;
  * the advertised schema merges tagged unions, so strict decoding would reject keys agents were shown.
  */
 const advertisedArgumentsOnly = (tool: Tool.Any) => {
-  const { properties } = advertisedJsonSchema(tool);
+  const { properties } = advertisedJsonSchema(tool, { decoding: true });
   const accepted = new Set(Predicate.isObject(properties) ? Object.keys(properties) : []);
   const acceptedText = [...accepted].join(", ") || "none";
   return Schema.Record(Schema.String, Schema.Unknown).check(
