@@ -19,6 +19,7 @@ import type { OrchestratorV2Error } from "../orchestration-v2/Orchestrator.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import { resolveInteractionMode, resolveRuntimeMode } from "./delegatedTaskModes.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
+import { aivaInteractionMode } from "../aiva/noPlanMode.ts";
 
 /**
  * Threads an agent starts over MCP are `mcp:<uuid>`, and agents often paste the
@@ -155,7 +156,8 @@ export function assertLiveCaller({ caller, scope }: Caller) {
 }
 
 export const assertFullAccess = (context: Caller, message: string) =>
-  context.limits.runtimeMode === "full-access" && context.limits.interactionMode === "default"
+  context.limits.runtimeMode === "full-access" &&
+  aivaInteractionMode(context.limits.interactionMode) === "default"
     ? Effect.void
     : Effect.fail(new OrchestratorMcpFailure({ code: "capability_denied", message }));
 

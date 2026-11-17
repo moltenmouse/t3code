@@ -1,5 +1,6 @@
 import * as Predicate from "effect/Predicate";
 import { Tool } from "effect/ai";
+import { aivaWithoutInteractionModeArgument } from "../aiva/noPlanMode.ts";
 
 type Json = unknown;
 type JsonObject = { [key: string]: Json };
@@ -102,5 +103,8 @@ const compact = (schema: Json, optional: boolean): Json => {
  * the `null` branch of optional properties. A tagged union of objects becomes one object.
  * Decoding still uses the full schema, so each tag's own required fields still apply.
  */
-export const advertisedJsonSchema = (tool: Tool.Any) =>
-  compact(Tool.getJsonSchema(tool), false) as ReturnType<typeof Tool.getJsonSchema>;
+export const advertisedJsonSchema = (tool: Tool.Any, options?: { readonly decoding?: boolean }) => {
+  const schema = compact(Tool.getJsonSchema(tool), false) as ReturnType<typeof Tool.getJsonSchema>;
+  // aiva P25: agents aren't offered interactionMode; a call that still sends one runs as default.
+  return options?.decoding === true ? schema : aivaWithoutInteractionModeArgument(schema);
+};

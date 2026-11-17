@@ -215,6 +215,9 @@ describe("aivaClaudeQueryOptions", () => {
       "mcp__t3-code__delegate_task",
       "mcp__t3-code__t3_thread_wait",
       "Agent",
+      // P25: Claude can't switch itself into plan mode.
+      "EnterPlanMode",
+      "ExitPlanMode",
     ]);
     expect(options.allowedTools).toEqual(["mcp__t3-code__*", "mcp__aiva__*"]);
     expect(options.mcpServers).toEqual({
@@ -241,10 +244,14 @@ describe("aivaClaudeQueryOptions", () => {
     expect(aivaClaudeQueryOptions("t1", base(), off).disallowedTools).toEqual([
       "WebSearch",
       "Agent",
+      "EnterPlanMode",
+      "ExitPlanMode",
       "AskUserQuestion",
     ]);
     expect(aivaClaudeQueryOptions("thread-native", base(), off).disallowedTools).toEqual([
       "WebSearch",
+      "EnterPlanMode",
+      "ExitPlanMode",
       "AskUserQuestion",
     ]);
     expect(aivaClaudeQueryOptions("t1", base(), settings).disallowedTools).not.toContain(

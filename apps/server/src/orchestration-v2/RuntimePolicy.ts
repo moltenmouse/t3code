@@ -14,6 +14,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
+import { aivaInteractionMode } from "../aiva/noPlanMode.ts";
 import * as ProviderInstanceRegistry from "../provider/ProviderInstanceRegistry.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ServerSettings from "../serverSettings.ts";
@@ -82,7 +83,7 @@ export const layer: Layer.Layer<RuntimePolicyV2> = Layer.succeed(RuntimePolicyV2
   resolve: Effect.fn("RuntimePolicyV2.resolve")(function (input) {
     return Effect.succeed({
       runtimeMode: input.thread.runtimeMode,
-      interactionMode: input.thread.interactionMode,
+      interactionMode: aivaInteractionMode(input.thread.interactionMode),
       cwd: input.thread.worktreePath,
     });
   }),
@@ -186,7 +187,7 @@ export const layerFromProjectStore: Layer.Layer<
           ));
         return ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
           runtimeMode: providerRuntimeMode(input.thread.runtimeMode, supportedRuntimeModes),
-          interactionMode: input.thread.interactionMode,
+          interactionMode: aivaInteractionMode(input.thread.interactionMode),
           cwd,
           ...(maxRuntimeMode === undefined ? {} : { maxRuntimeMode }),
         });

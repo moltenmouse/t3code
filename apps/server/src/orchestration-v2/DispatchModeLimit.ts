@@ -7,6 +7,7 @@ import {
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import type * as Ref from "effect/Ref";
+import { aivaInteractionMode } from "../aiva/noPlanMode.ts";
 
 export interface DispatchModes {
   readonly runtimeMode: RuntimeMode;
@@ -36,7 +37,8 @@ export const exceededDispatchModeLimit = (
 ): "runtime" | "interaction" | undefined =>
   isRuntimeModeAbove(modes.runtimeMode, limit.runtimeMode)
     ? "runtime"
-    : interactionModeRank[modes.interactionMode] > interactionModeRank[limit.interactionMode]
+    : interactionModeRank[aivaInteractionMode(modes.interactionMode)] >
+        interactionModeRank[aivaInteractionMode(limit.interactionMode)]
       ? "interaction"
       : undefined;
 
