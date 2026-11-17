@@ -12,6 +12,7 @@ import {
   ProviderThreadId,
   RunId,
   RuntimeRequestId,
+  ScheduledTaskId,
   ThreadId,
   TurnItemId,
 } from "@t3tools/contracts";
@@ -414,6 +415,62 @@ it.effect("sql: the user-authored message time ignores agent notifications", () 
       DateTime.formatIso(shellThread!.latestUserAuthoredMessageAt!),
       DateTime.formatIso(written),
     );
+  }).pipe(Effect.provide(layerSql)),
+);
+
+// aiva P26 (AIV-614): Aiva's sidebar goes by the last message a person wrote. A loop's delivery is stored as
+// its task's author's (`createdBy: "user"`), but nobody wrote it then.
+it.effect("sql: the user-authored message time ignores a scheduled task's deliveries", () =>
+  Effect.gen(function* () {
+    const store = yield* ProjectionStore.ProjectionStoreV2;
+    const threadId = yield* createThread("loop-woken");
+    yield* createRun(threadId);
+    const message = (id: string, at: DateTime.Utc, scheduled: boolean) =>
+      store.apply({
+        id: EventId.make(`event:settlement:${id}`),
+        type: "message.updated",
+        threadId,
+        occurredAt: at,
+        payload: {
+          createdBy: "user",
+          creationSource: "web",
+          ...(scheduled ? { scheduledTaskId: ScheduledTaskId.make("task:loop") } : {}),
+          id: MessageId.make(`message:settlement:${id}`),
+          threadId,
+          runId: null,
+          nodeId: null,
+          role: "user",
+          text: id,
+          attachments: [],
+          streaming: false,
+          createdAt: at,
+          updatedAt: at,
+        },
+      });
+    const authoredAt = Effect.gen(function* () {
+      const [candidate] = yield* store.getSettlementCandidates(threadId);
+      const shell = (yield* store.getShellSnapshot()).threads.find(
+        (thread) => thread.id === threadId,
+      );
+      const projected = ProjectionStore.threadShellFromProjection(
+        yield* store.getThreadProjection(threadId),
+      );
+      return [candidate, shell, projected].map((row) =>
+        DateTime.formatIso(row!.latestUserAuthoredMessageAt!),
+      );
+    });
+    const written = DateTime.subtract(now, { hours: 2 });
+    yield* message("written", written, false);
+    yield* message("loop", DateTime.subtract(now, { hours: 1 }), true);
+    assert.deepStrictEqual(yield* authoredAt, Array(3).fill(DateTime.formatIso(written)));
+    const [candidate] = yield* store.getSettlementCandidates(threadId);
+    assert.equal(
+      DateTime.formatIso(candidate!.latestUserMessageAt!),
+      DateTime.formatIso(DateTime.subtract(now, { hours: 1 })),
+      "still the latest user-role message",
+    );
+    yield* message("written-again", now, false);
+    assert.deepStrictEqual(yield* authoredAt, Array(3).fill(DateTime.formatIso(now)));
   }).pipe(Effect.provide(layerSql)),
 );
 

@@ -1684,6 +1684,14 @@ const linkCardStillAsks = (
   latestUserAuthoredMessageAt === null ||
   !DateTime.isGreaterThan(latestUserAuthoredMessageAt, item.startedAt ?? item.updatedAt);
 
+/**
+ * aiva P26: a message a person wrote, for `latestUserAuthoredMessageAt`. A scheduled task's delivery (a loop) is
+ * stored as its task's author's (`createdBy: "user"` for one a person made), but nobody wrote it then. The shell
+ * queries' `latest_user_authored_message_at` and the link card's check leave it out the same way.
+ */
+const isWrittenByAPerson = (message: OrchestrationV2ConversationMessage): boolean =>
+  message.createdBy === "user" && message.scheduledTaskId === undefined;
+
 export function threadShellFromProjection(
   projection: OrchestrationV2ThreadProjection,
 ): OrchestrationV2ThreadShell {
@@ -1727,8 +1735,7 @@ export function threadShellFromProjection(
       (left, right) =>
         DateTime.toEpochMillis(right.updatedAt) - DateTime.toEpochMillis(left.updatedAt),
     );
-  const latestUserAuthoredMessageAt =
-    userMessages.find((message) => message.createdBy === "user")?.updatedAt ?? null;
+  const latestUserAuthoredMessageAt = userMessages.find(isWrittenByAPerson)?.updatedAt ?? null;
   if (pendingRuntimeRequest === null || pendingRuntimeRequest.kind === "user_input") {
     const waitingCard = secretRequestAsPendingInput(
       projection.turnItems
@@ -7807,6 +7814,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 WHERE message.thread_id = t.thread_id
                   AND message.role = 'user'
                   AND json_extract(message.payload_json, '$.createdBy') = 'user'
+                  AND json_extract(message.payload_json, '$.scheduledTaskId') IS NULL
                   AND NOT ${isIdleCompactionMessage("message")}
                 ORDER BY message.updated_at DESC, message.message_id DESC
                 LIMIT 1
@@ -8103,6 +8111,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 FROM orchestration_v2_projection_messages message
                 WHERE message.thread_id = t.thread_id AND message.role = 'user'
                   AND json_extract(message.payload_json, '$.createdBy') = 'user'
+                  AND json_extract(message.payload_json, '$.scheduledTaskId') IS NULL
                   AND NOT ${isIdleCompactionMessage("message")}
                 ORDER BY message.updated_at DESC, message.message_id DESC
                 LIMIT 1
@@ -8149,6 +8158,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                     SELECT 1 FROM orchestration_v2_projection_messages message
                     WHERE message.thread_id = t.thread_id AND message.role = 'user'
                       AND json_extract(message.payload_json, '$.createdBy') = 'user'
+                      AND json_extract(message.payload_json, '$.scheduledTaskId') IS NULL
                       AND NOT ${isIdleCompactionMessage("message")}
                       AND message.updated_at > COALESCE(
                         json_extract(link.payload_json, '$.startedAt'), link.updated_at
