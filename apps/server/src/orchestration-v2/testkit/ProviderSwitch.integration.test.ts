@@ -3226,6 +3226,7 @@ describe("orchestration v2 provider switching", () => {
     ["runtime mode", "runtime-mode"],
     ["worktree", "worktree"],
     ["provider instance", "instance"],
+    ["provider instance (unless the caller ends it, Aiva P28)", "instance-ending-work"],
   ] as const)("keeps background work alive when the %s changes on an idle thread", ([, change]) =>
     Effect.gen(function* () {
       const cwd = yield* checkpointWorkspace(`settings-background-${change}`);
@@ -3291,12 +3292,41 @@ describe("orchestration v2 provider switching", () => {
                     commandId,
                     threadId,
                     modelSelection: secondSelection,
+                    ...(change === "instance-ending-work" ? { endBackgroundWork: true } : {}),
                   },
           )
-          .pipe(Effect.ignore);
+          .pipe(change === "instance-ending-work" ? Effect.asVoid : Effect.ignore);
         yield* worker.drain();
 
         const projection = yield* orchestrator.getThreadProjection(threadId);
+        if (change === "instance-ending-work") {
+          assert.equal(projection.thread.modelSelection.instanceId, secondSelection.instanceId);
+          // A used-up account's session can't run its next turn anyway: the move ends its work, and the next turn
+          // runs on the new account.
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            createdBy: "agent",
+            creationSource: "mcp",
+            commandId: CommandId.make(`command:settings-background-${change}:next`),
+            threadId,
+            messageId: MessageId.make(`message:settings-background-${change}:next`),
+            text: "Switched accounts. Carry on.",
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+          });
+          yield* worker.drain();
+          const moved = yield* waitForIdle(threadId);
+          yield* worker.drain();
+          assert.deepEqual(yield* Ref.get(closedSessions), [session!.id]);
+          assert.deepEqual(
+            moved.runs.map((run) => [run.providerInstanceId, run.status]),
+            [
+              [CLAUDE_MODEL_SELECTION.instanceId, "completed"],
+              [secondSelection.instanceId, "completed"],
+            ],
+          );
+          return;
+        }
         // Refusing or deferring are both fine; closing the busy process is not.
         assert.deepEqual(yield* Ref.get(closedSessions), []);
         assert.deepEqual(
@@ -3334,7 +3364,7 @@ describe("orchestration v2 provider switching", () => {
                 driver: CLAUDE_DRIVER,
                 capabilities: ClaudeProviderCapabilitiesV2,
                 modelSelection: secondSelection,
-                responseByRunOrdinal: {},
+                responseByRunOrdinal: { 2: "Carried on" },
                 capturedTurns,
               }),
             ]),

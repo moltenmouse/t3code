@@ -4466,7 +4466,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         session.status !== "stopped" &&
         session.status !== "error",
     );
-    if (command.type !== "thread.archive" && command.type !== "thread.settle") {
+    // Aiva P28: a caller moving a thread off a used-up account may end that work, as archive does.
+    const endsBackgroundWork =
+      command.type === "thread.archive" ||
+      command.type === "thread.settle" ||
+      ((command.type === "thread.model-selection.set" || command.type === "provider.switch") &&
+        command.endBackgroundWork === true);
+    if (!endsBackgroundWork) {
       for (const session of liveSessions) {
         if (yield* sessionHasBackgroundWork(session, providerContext!.providerThreads)) {
           return yield* new OrchestratorDispatchError({

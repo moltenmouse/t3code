@@ -221,7 +221,13 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
         } = yield* readThread(input.threadId);
         const type = modelSelectionCommandType(thread.providerInstanceId, modelSelection);
         const result = yield* threads
-          .dispatch({ type, threadId: thread.id, commandId: yield* newCommandId(), modelSelection })
+          .dispatch({
+            type,
+            threadId: thread.id,
+            commandId: yield* newCommandId(),
+            modelSelection,
+            ...(input.endBackgroundWork === true ? { endBackgroundWork: true } : {}),
+          })
           .pipe(Effect.mapError(dispatchFailure));
         return { sequence: result.sequence };
       }),
