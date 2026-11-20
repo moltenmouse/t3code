@@ -3322,6 +3322,8 @@ export const OrchestrationV2Command = Schema.Union([
     commandId: CommandId,
     threadId: ThreadId,
     modelSelection: ModelSelection,
+    /** Aiva P28: end the replaced session's background agents and commands instead of refusing the change. */
+    endBackgroundWork: Schema.optional(Schema.Boolean),
   }),
   Schema.Struct({
     type: Schema.Literal("provider-session.detach"),
@@ -3564,6 +3566,8 @@ export const OrchestrationV2Command = Schema.Union([
     commandId: CommandId,
     threadId: ThreadId,
     modelSelection: ModelSelection,
+    /** Aiva P28: end the replaced session's background agents and commands instead of refusing the change. */
+    endBackgroundWork: Schema.optional(Schema.Boolean),
   }),
 ]);
 export type OrchestrationV2Command = typeof OrchestrationV2Command.Type;

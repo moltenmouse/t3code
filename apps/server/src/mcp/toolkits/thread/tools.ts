@@ -159,6 +159,10 @@ const ThreadConfigureTool = Tool.make("t3_thread_configure", {
     environmentId: OrchestratorMcpEnvironmentTarget,
     threadId: Schema.optional(ThreadId),
     modelSelection: Schema.optional(ModelSelection),
+    endBackgroundWork: Schema.optional(Schema.Boolean).annotate({
+      description:
+        "With `modelSelection`: end the session's background agents and commands instead of refusing while they run.",
+    }),
   }),
   success: Schema.Union([threadConfiguration, OrchestrationV2DispatchCommandResult]),
 }).annotate(Tool.Destructive, true);
