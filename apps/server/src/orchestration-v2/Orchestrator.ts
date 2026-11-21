@@ -209,6 +209,11 @@ import {
   aivaFailsMessagesAfterFailedSetup,
   aivaLatestExecutedRun,
 } from "../aiva/retryFailedSetup.ts";
+import {
+  aivaReleasesQueueHolds,
+  staleBufferedWakes,
+  stoppedSinceLastStart,
+} from "../aiva/queueHolds.ts";
 
 const isMessageQuestionAnswer = Schema.is(
   Schema.Union([TrimmedNonEmptyString, Schema.NonEmptyArray(TrimmedNonEmptyString)]),
@@ -2366,6 +2371,20 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (yield* cancelStaleQuestionWakes(projection)) {
         projection = yield* readCommandProjection(threadId);
       }
+      // aiva P29 (AIV-639): a wake left on an account the thread moved off blocked its queue.
+      const staleWakes = aivaReleasesQueueHolds() ? staleBufferedWakes(projection) : [];
+      if (staleWakes.length > 0) {
+        const now = yield* DateTime.now;
+        yield* Effect.logInfo("Cancelling queued wakes on an instance the thread has left", {
+          threadId,
+          runIds: staleWakes.map((run) => run.id),
+          instanceId: projection.thread.modelSelection.instanceId,
+        });
+        yield* writeSystemEvents(
+          staleWakes.flatMap((run) => queuedRunCancellationEvents(projection, run, now)),
+        );
+        projection = yield* readCommandProjection(threadId);
+      }
       let storedQueuedRun =
         options?.queuedRunId === undefined
           ? nextQueuedRun(projection)
@@ -3278,11 +3297,61 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         .filter((message) => message.createdBy !== "user" || message.scheduledTaskId !== undefined)
         .map((message) => message.id),
     );
+    // aiva P29: a finished restart continuation ends the restart's hold on a person's messages too.
+    const pastRestart =
+      aivaReleasesQueueHolds() &&
+      projection.runs.find((run) => run.id === completedRunId)?.restartContinuationOfRunId !==
+        undefined;
     const now = yield* DateTime.now;
-    const released = held.filter((run) => unattended.has(run.userMessageId));
+    const released = held.filter((run) => pastRestart || unattended.has(run.userMessageId));
     if (released.length === 0) return;
     yield* writeSystemEvents(
       released.map((run) => ({
+        type: "run.updated" as const,
+        threadId,
+        runId: run.id,
+        providerInstanceId: run.providerInstanceId,
+        occurredAt: now,
+        payload: { ...run, queueHeld: false },
+      })),
+    );
+  });
+
+  // aiva P29 (AIV-639): Aiva's apps never show a held queue or resume one, so a hold nobody chose
+  // (a restart, a failed turn, a wait on background work) ends once the thread can run again:
+  // not after a person's Stop, a failed worktree setup, or on an account out of usage.
+  const aivaReleaseHolds = Effect.fn("Orchestrator.aivaReleaseHolds")(function* (
+    threadId: ThreadId,
+    options?: { readonly unlessContinuing?: boolean },
+  ) {
+    if (!aivaReleasesQueueHolds()) return;
+    const held = yield* projectionStore.getHeldQueuedRuns(threadId);
+    if (held.length === 0) return;
+    const projection = yield* readCommandProjection(threadId);
+    if (
+      projection.thread.archivedAt !== null ||
+      projection.thread.deletedAt !== null ||
+      projection.runs.some(isActiveRun) ||
+      worktreeSetupPending(projection)
+    )
+      return;
+    const now = yield* DateTime.now;
+    if (usageLimitHoldsQueue(projection, projection.thread.modelSelection.instanceId, now)) return;
+    // A restart continuation still to come goes first; its completion releases the rest.
+    const latest = aivaLatestExecutedRun(projection.runs);
+    if (latest !== null && options?.unlessContinuing === true) {
+      if (yield* awaitsRestartContinuation(latest)) return;
+    }
+    const { turnItems: stops } = yield* projectionStore.getThreadRecords(threadId, ["turnItems"], {
+      turnItemTypes: ["run_interrupt_request"],
+    });
+    if (stoppedSinceLastStart(projection.runs, stops)) return;
+    yield* Effect.logInfo("Releasing a held queue nobody can resume", {
+      threadId,
+      runIds: held.map((run) => run.id),
+    });
+    yield* writeSystemEvents(
+      held.map((run) => ({
         type: "run.updated" as const,
         threadId,
         runId: run.id,
@@ -3298,6 +3367,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     let resumed = 0;
     for (const threadId of threadIds) {
       const resumedThread = yield* Effect.gen(function* () {
+        yield* threadDispatch.withLock(
+          threadId,
+          aivaReleaseHolds(threadId, { unlessContinuing: true }),
+        );
         if (!(yield* projectionStore.canStartQueuedRun(threadId))) return false;
         yield* threadDispatch.withLock(threadId, startNextQueuedRun(threadId));
         return true;
@@ -15691,7 +15764,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       committed.committed &&
       committed.storedEvents.some(({ event }) => event.type === "thread.provider-switched")
     ) {
-      yield* startNextQueuedRun(command.threadId).pipe(
+      // aiva P29: and a queue held on the account it left runs on this one.
+      yield* aivaReleaseHolds(command.threadId).pipe(
+        Effect.andThen(startNextQueuedRun(command.threadId)),
         Effect.catchCause((cause) =>
           Effect.logWarning("Failed to start the queue after a provider switch", {
             threadId: command.threadId,

@@ -1,3 +1,8 @@
+// @effect-diagnostics nodeBuiltinImport:off -- the aiva P29 cases write a real aiva.json.
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
+
 import { vi } from "vite-plus/test";
 import { historyResponseItems } from "@t3tools/provider-core/server/handoffBudget";
 import { assert, describe, it } from "@effect/vitest";
@@ -455,6 +460,19 @@ function makeTestAdapter(input: {
         };
         return runtime;
       }),
+  };
+}
+
+// aiva P29: the cases that run as an Aiva machine write a real aiva.json.
+function useAivaSettings(aiva: boolean): () => void {
+  const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "aiva-p29-"));
+  const previous = process.env.T3CODE_AIVA_SETTINGS;
+  process.env.T3CODE_AIVA_SETTINGS = NodePath.join(dir, "aiva.json");
+  if (aiva) NodeFS.writeFileSync(NodePath.join(dir, "aiva.json"), "{}");
+  return () => {
+    if (previous === undefined) delete process.env.T3CODE_AIVA_SETTINGS;
+    else process.env.T3CODE_AIVA_SETTINGS = previous;
+    NodeFS.rmSync(dir, { recursive: true, force: true });
   };
 }
 
@@ -2744,6 +2762,280 @@ describe("orchestration v2 provider switching", () => {
         ],
       );
     }),
+  );
+
+  // aiva P29 (AIV-639): node-002 queues stuck for hours. "wake": a Claude wake pinned to an account
+  // that ran out sat ahead of a person's message after the thread moved. "held": nothing in Aiva
+  // resumes a held queue, so it runs once the thread moves or at startup. "stopped": a person's
+  // Stop on a run whose provider start failed keeps it held through both.
+  it.live.each<{
+    readonly blocker: "wake" | "held" | "stopped";
+    readonly step: "switch" | "restart";
+    readonly aiva: boolean;
+  }>([
+    { blocker: "wake", step: "switch", aiva: true },
+    { blocker: "wake", step: "switch", aiva: false },
+    { blocker: "held", step: "switch", aiva: true },
+    { blocker: "held", step: "switch", aiva: false },
+    { blocker: "held", step: "restart", aiva: true },
+    { blocker: "held", step: "restart", aiva: false },
+    { blocker: "stopped", step: "switch", aiva: true },
+    { blocker: "stopped", step: "restart", aiva: true },
+  ])(
+    "a person's queued message behind a $blocker runs after a $step (aiva $aiva)",
+    ({ blocker, step, aiva }) =>
+      Effect.gen(function* () {
+        yield* Effect.acquireRelease(
+          Effect.sync(() => useAivaSettings(aiva)),
+          (restore) => Effect.sync(restore),
+        );
+        const cwd = yield* checkpointWorkspace("queued-behind-stale-holds");
+        const capturedTurns = yield* Ref.make<ReadonlyArray<CapturedTurn>>([]);
+        const started = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const failLookupOnce = yield* Ref.make(false);
+        const firstSelection: ModelSelection = {
+          ...CODEX_MODEL_SELECTION,
+          instanceId: ProviderInstanceId.make("codex-first"),
+        };
+        const nextSelection: ModelSelection = {
+          ...CODEX_MODEL_SELECTION,
+          instanceId: ProviderInstanceId.make("codex-next"),
+        };
+        const resetAt = DateTime.formatIso(DateTime.add(yield* DateTime.now, { hours: 30 }));
+        const failure =
+          blocker === "wake"
+            ? makeProviderFailure({
+                message: "You've hit your usage limit.",
+                code: "usage_limit_exceeded",
+                class: "usage_limit",
+                retryable: true,
+                resetAt,
+              })
+            : makeProviderFailure({
+                message: "The provider process exited.",
+                class: "provider_error",
+                retryable: true,
+              });
+        const adapters = [
+          makeTestAdapter({
+            instanceId: firstSelection.instanceId,
+            driver: CODEX_DRIVER,
+            capabilities: CodexProviderCapabilitiesV2,
+            modelSelection: firstSelection,
+            responseByRunOrdinal: {},
+            capturedTurns,
+            holdFirstTurn: started,
+            releaseFirstTurn: release,
+            failedRunOrdinals: new Set(blocker === "stopped" ? [] : [1]),
+            failure,
+          }),
+          makeTestAdapter({
+            instanceId: nextSelection.instanceId,
+            driver: CODEX_DRIVER,
+            capabilities: CodexProviderCapabilitiesV2,
+            modelSelection: nextSelection,
+            responseByRunOrdinal: {},
+            capturedTurns,
+          }),
+        ];
+        const layerRegistry = Layer.succeed(
+          ProviderAdapterRegistry.ProviderAdapterRegistryV2,
+          ProviderAdapterRegistry.ProviderAdapterRegistryV2.of({
+            get: (instanceId) =>
+              Effect.gen(function* () {
+                const adapter = adapters.find((candidate) => candidate.instanceId === instanceId);
+                // "stopped": the queued start after the first turn can't reach its provider.
+                const lookupFails =
+                  instanceId === firstSelection.instanceId &&
+                  (yield* Ref.getAndSet(failLookupOnce, false));
+                if (adapter === undefined || lookupFails) {
+                  return yield* new ProviderAdapterRegistry.ProviderAdapterRegistryLookupError({
+                    instanceId,
+                  });
+                }
+                return adapter;
+              }),
+            list: () => Effect.succeed(adapters.map((adapter) => adapter.instanceId)),
+            getMetadata: (instanceId) =>
+              adapters.some((candidate) => candidate.instanceId === instanceId)
+                ? Effect.succeed({
+                    driver: CODEX_DRIVER,
+                    continuationKey: "codex:shared-native-account-history",
+                    enabled: true,
+                    capabilities: CodexProviderCapabilitiesV2,
+                  })
+                : Effect.fail(
+                    new ProviderAdapterRegistry.ProviderAdapterRegistryLookupError({ instanceId }),
+                  ),
+          }),
+        );
+        const testThreadId = ThreadId.make("thread:queued-behind-stale-holds");
+        const after = yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            createdBy: "user",
+            creationSource: "web",
+            commandId: CommandId.make("command:queued-behind-stale-holds:create"),
+            threadId: testThreadId,
+            projectId: ProjectId.make("project:queued-behind-stale-holds"),
+            title: "Queued behind stale holds",
+            modelSelection: firstSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: cwd,
+          });
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            createdBy: "agent",
+            creationSource: "mcp",
+            commandId: CommandId.make("command:queued-behind-stale-holds:first"),
+            threadId: testThreadId,
+            messageId: MessageId.make("message:queued-behind-stale-holds:first"),
+            text: "The first turn",
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+            deliveryIntent: "auto",
+          });
+          yield* Deferred.await(started);
+          if (blocker === "wake") {
+            // Claude Code began a turn of its own in the running session (a background task ended).
+            yield* orchestrator.dispatch({
+              type: "message.dispatch",
+              createdBy: "agent",
+              creationSource: "provider",
+              commandId: CommandId.make("command:queued-behind-stale-holds:wake"),
+              threadId: testThreadId,
+              messageId: MessageId.make("message:queued-behind-stale-holds:wake"),
+              text: "Background task completed.",
+              attachments: [],
+              dispatchMode: { type: "queue_after_active" },
+              notification: {
+                source: { kind: "background_task" },
+                outcome: "updated",
+                summary: "Background activity updated",
+              },
+            });
+          }
+          if (blocker === "stopped") {
+            // Queued next, and its provider start fails.
+            yield* orchestrator.dispatch({
+              type: "message.dispatch",
+              createdBy: "agent",
+              creationSource: "mcp",
+              commandId: CommandId.make("command:queued-behind-stale-holds:unstarted"),
+              threadId: testThreadId,
+              messageId: MessageId.make("message:queued-behind-stale-holds:unstarted"),
+              text: "A turn that never starts",
+              attachments: [],
+              dispatchMode: { type: "queue_after_active" },
+            });
+          }
+          // As Aiva's apps send a person's message (aiva-client `person_message`).
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            createdBy: "user",
+            creationSource: "web",
+            commandId: CommandId.make("command:queued-behind-stale-holds:person"),
+            threadId: testThreadId,
+            messageId: MessageId.make("message:queued-behind-stale-holds:person"),
+            text: "The person's own message",
+            attachments: [],
+            dispatchMode: { type: "queue_after_active" },
+          });
+          if (blocker === "stopped") yield* Ref.set(failLookupOnce, true);
+          yield* Deferred.succeed(release, undefined);
+          // A usage limit leaves the queue waiting on the account; another failure holds it.
+          yield* orchestrator.streamStoredEvents.pipe(
+            Stream.filter(
+              (event) =>
+                event.event.type === "run.updated" &&
+                (blocker === "wake"
+                  ? event.event.payload.ordinal === 1 && event.event.payload.status === "failed"
+                  : event.event.payload.userMessageId ===
+                      MessageId.make("message:queued-behind-stale-holds:person") &&
+                    event.event.payload.queueHeld === true),
+            ),
+            Stream.runHead,
+          );
+          yield* worker.drain();
+          if (blocker === "stopped") {
+            // The person stops the thread: its marker lands on the run that never started.
+            yield* orchestrator.dispatch({
+              type: "thread.stop",
+              commandId: CommandId.make("command:queued-behind-stale-holds:stop"),
+              threadId: testThreadId,
+            });
+            yield* worker.drain();
+          }
+          if (step === "switch") {
+            // The sidecar's switcher moves the thread to another account (t3_thread_configure).
+            yield* orchestrator.dispatch({
+              type: "thread.model-selection.set",
+              commandId: CommandId.make("command:queued-behind-stale-holds:switch"),
+              threadId: testThreadId,
+              modelSelection: nextSelection,
+            });
+          } else {
+            yield* orchestrator.resumeQueuedRuns;
+          }
+          yield* worker.drain();
+          const settled =
+            aiva && blocker !== "stopped"
+              ? yield* waitForIdle(testThreadId)
+              : yield* orchestrator.getThreadProjection(testThreadId);
+          yield* worker.drain();
+          return settled;
+        }).pipe(
+          Effect.provide(
+            ProviderReplayHarness.layerWithRegistry(
+              {
+                name: "queued-behind-stale-holds",
+                runtimePolicyOverride: {
+                  cwd,
+                  approvalPolicy: "never",
+                  sandboxPolicy: {
+                    type: "readOnly",
+                    access: { type: "fullAccess" },
+                    networkAccess: false,
+                  },
+                },
+              },
+              layerRegistry,
+            ),
+          ),
+        );
+        const statusOf = (messageId: string) =>
+          after.runs.find((run) => run.userMessageId === MessageId.make(messageId))?.status;
+        const ranOn = step === "switch" ? nextSelection.instanceId : firstSelection.instanceId;
+        if (aiva && blocker !== "stopped") {
+          assert.equal(statusOf("message:queued-behind-stale-holds:person"), "completed");
+          if (blocker === "wake") {
+            assert.equal(statusOf("message:queued-behind-stale-holds:wake"), "cancelled");
+          }
+          assert.deepEqual(
+            (yield* Ref.get(capturedTurns)).map((turn) => [
+              turn.modelSelection.instanceId,
+              turn.text,
+            ]),
+            [
+              [firstSelection.instanceId, "The first turn"],
+              [ranOn, "The person's own message"],
+            ],
+          );
+        } else {
+          // Upstream: the queue waits for someone to resume it, or for the used-up account; and
+          // a person's Stop keeps it held on Aiva too.
+          assert.equal(statusOf("message:queued-behind-stale-holds:person"), "queued");
+          assert.deepEqual(
+            (yield* Ref.get(capturedTurns)).map((turn) => turn.text),
+            ["The first turn"],
+          );
+        }
+      }),
   );
 
   it.live("finishes earlier queued Codex turns before handing context to queued Claude", () =>
