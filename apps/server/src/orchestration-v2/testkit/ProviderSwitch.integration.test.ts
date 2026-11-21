@@ -2764,6 +2764,218 @@ describe("orchestration v2 provider switching", () => {
     }),
   );
 
+  // aiva P30 (AIV-639): on node-002 a person's seven messages stayed queued on the account the
+  // thread had left, behind its usage limit, while the thread ran on another. The message keeps
+  // its own model and runs on the thread's account once the thread moves.
+  it.live.each([true, false])(
+    "runs a person's message queued on a limited account on the account the thread moved to (aiva %s)",
+    (aiva) =>
+      Effect.gen(function* () {
+        yield* Effect.acquireRelease(
+          Effect.sync(() => useAivaSettings(aiva)),
+          (restore) => Effect.sync(restore),
+        );
+        const cwd = yield* checkpointWorkspace("queued-person-follows-account");
+        const capturedTurns = yield* Ref.make<ReadonlyArray<CapturedTurn>>([]);
+        const started = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const accountA: ModelSelection = {
+          ...CODEX_MODEL_SELECTION,
+          instanceId: ProviderInstanceId.make("codex-account-a"),
+        };
+        const accountB: ModelSelection = {
+          ...CODEX_MODEL_SELECTION,
+          instanceId: ProviderInstanceId.make("codex-account-b"),
+        };
+        const queuedPick: ModelSelection = { ...accountA, model: "gpt-5.5" };
+        const resetAt = DateTime.formatIso(DateTime.add(yield* DateTime.now, { hours: 30 }));
+        const adapters = [
+          makeTestAdapter({
+            instanceId: accountA.instanceId,
+            driver: CODEX_DRIVER,
+            capabilities: CodexProviderCapabilitiesV2,
+            modelSelection: accountA,
+            responseByRunOrdinal: {},
+            capturedTurns,
+            holdFirstTurn: started,
+            releaseFirstTurn: release,
+            failedRunOrdinals: new Set([1]),
+            failure: makeProviderFailure({
+              message: "You've hit your usage limit.",
+              code: "usage_limit_exceeded",
+              class: "usage_limit",
+              retryable: true,
+              resetAt,
+            }),
+          }),
+          makeTestAdapter({
+            instanceId: accountB.instanceId,
+            driver: CODEX_DRIVER,
+            capabilities: CodexProviderCapabilitiesV2,
+            modelSelection: accountB,
+            responseByRunOrdinal: {},
+            capturedTurns,
+          }),
+        ];
+        // Both accounts share one native history, as Aiva's accounts of a provider do.
+        const layerRegistry = Layer.succeed(
+          ProviderAdapterRegistry.ProviderAdapterRegistryV2,
+          ProviderAdapterRegistry.ProviderAdapterRegistryV2.of({
+            get: (instanceId) => {
+              const adapter = adapters.find((candidate) => candidate.instanceId === instanceId);
+              return adapter === undefined
+                ? Effect.fail(
+                    new ProviderAdapterRegistry.ProviderAdapterRegistryLookupError({ instanceId }),
+                  )
+                : Effect.succeed(adapter);
+            },
+            list: () => Effect.succeed(adapters.map((adapter) => adapter.instanceId)),
+            getMetadata: (instanceId) =>
+              adapters.some((candidate) => candidate.instanceId === instanceId)
+                ? Effect.succeed({
+                    driver: CODEX_DRIVER,
+                    continuationKey: "codex:shared-native-account-history",
+                    enabled: true,
+                    capabilities: CodexProviderCapabilitiesV2,
+                  })
+                : Effect.fail(
+                    new ProviderAdapterRegistry.ProviderAdapterRegistryLookupError({ instanceId }),
+                  ),
+          }),
+        );
+        const threadId = ThreadId.make("thread:queued-person-follows-account");
+        const personMessage = (
+          id: string,
+          text: string,
+          dispatchMode: "start_immediately" | "queue_after_active",
+          modelSelection: ModelSelection,
+        ): OrchestrationV2Command => ({
+          type: "message.dispatch",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make(`command:queued-person-follows-account:${id}`),
+          threadId,
+          messageId: MessageId.make(`message:queued-person-follows-account:${id}`),
+          text,
+          attachments: [],
+          modelSelection,
+          dispatchMode: { type: dispatchMode },
+        });
+        const { held, delivered } = yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            createdBy: "user",
+            creationSource: "web",
+            commandId: CommandId.make("command:queued-person-follows-account:create"),
+            threadId,
+            projectId: ProjectId.make("project:queued-person-follows-account"),
+            title: "Queued person follows account",
+            modelSelection: accountA,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: cwd,
+          });
+          yield* orchestrator.dispatch(
+            personMessage("first", "Start the work.", "start_immediately", accountA),
+          );
+          yield* Deferred.await(started);
+          // Queued while account A still runs: its selection is frozen on account A.
+          yield* orchestrator.dispatch(
+            personMessage(
+              "queued",
+              "The person's queued message",
+              "queue_after_active",
+              queuedPick,
+            ),
+          );
+          yield* Deferred.succeed(release, undefined);
+          yield* orchestrator.streamStoredEvents.pipe(
+            Stream.filter(
+              (event) =>
+                event.event.type === "run.updated" &&
+                event.event.payload.ordinal === 1 &&
+                event.event.payload.status === "failed",
+            ),
+            Stream.runHead,
+          );
+          yield* worker.drain();
+          const held = yield* orchestrator.getThreadProjection(threadId);
+          // The sidecar moves the thread off the used-up account (t3_thread_configure).
+          yield* orchestrator.dispatch({
+            type: "thread.model-selection.set",
+            commandId: CommandId.make("command:queued-person-follows-account:switch"),
+            threadId,
+            modelSelection: accountB,
+          });
+          const delivered = aiva
+            ? yield* waitForIdle(threadId).pipe(
+                Effect.timeoutOrElse({
+                  duration: "20 seconds",
+                  orElse: () => orchestrator.getThreadProjection(threadId),
+                }),
+              )
+            : yield* orchestrator.getThreadProjection(threadId);
+          yield* worker.drain();
+          return { held, delivered };
+        }).pipe(
+          Effect.provide(
+            ProviderReplayHarness.layerWithRegistry(
+              {
+                name: "queued-person-follows-account",
+                runtimePolicyOverride: {
+                  cwd,
+                  approvalPolicy: "never",
+                  sandboxPolicy: {
+                    type: "readOnly",
+                    access: { type: "fullAccess" },
+                    networkAccess: false,
+                  },
+                },
+              },
+              layerRegistry,
+            ),
+          ),
+        );
+        assert.deepEqual(
+          held.runs.map((run) => [run.providerInstanceId, run.status]),
+          [
+            [accountA.instanceId, "failed"],
+            [accountA.instanceId, "queued"],
+          ],
+        );
+        assert.deepEqual(
+          delivered.runs
+            .toSorted((left, right) => left.ordinal - right.ordinal)
+            .map((run) => [run.providerInstanceId, run.modelSelection.model, run.status]),
+          aiva
+            ? [
+                [accountA.instanceId, accountA.model, "failed"],
+                [accountB.instanceId, queuedPick.model, "completed"],
+              ]
+            : [
+                [accountA.instanceId, accountA.model, "failed"],
+                [accountA.instanceId, queuedPick.model, "queued"],
+              ],
+        );
+        assert.deepEqual(
+          (yield* Ref.get(capturedTurns)).map((turn) => [
+            turn.modelSelection.instanceId,
+            turn.modelSelection.model,
+            turn.text,
+          ]),
+          aiva
+            ? [
+                [accountA.instanceId, accountA.model, "Start the work."],
+                [accountB.instanceId, queuedPick.model, "The person's queued message"],
+              ]
+            : [[accountA.instanceId, accountA.model, "Start the work."]],
+        );
+      }),
+  );
+
   // aiva P29 (AIV-639): node-002 queues stuck for hours. "wake": a Claude wake pinned to an account
   // that ran out sat ahead of a person's message after the thread moved. "held": nothing in Aiva
   // resumes a held queue, so it runs once the thread moves or at startup. "stopped": a person's
