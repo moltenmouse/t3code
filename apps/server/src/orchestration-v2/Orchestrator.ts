@@ -1583,6 +1583,33 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     return driver === "codex" || driver === "claudeAgent" ? driver : undefined;
   });
 
+  // aiva P30 (AIV-639): a run queued on an account the thread has since moved off runs on the
+  // thread's account of the same driver, keeping its own model; left there, it waited out that
+  // account's usage limit. A buffered wake stays on its instance (P29 cancels it there).
+  const aivaQueuedRunSelection = Effect.fn("Orchestrator.aivaQueuedRunSelection")(function* (
+    projection: Pick<OrchestrationV2ThreadProjection, "thread" | "messages">,
+    run: OrchestrationV2Run,
+  ) {
+    const selection = queuedRunModelSelection(projection, run);
+    const current = projection.thread.modelSelection.instanceId;
+    const message = projection.messages.find((candidate) => candidate.id === run.userMessageId);
+    if (
+      !aivaReleasesQueueHolds() ||
+      selection.instanceId === current ||
+      message === undefined ||
+      isBufferedProviderNotification(message)
+    )
+      return selection;
+    const sameDriver = yield* Effect.all([
+      providerAdapters.get(selection.instanceId),
+      providerAdapters.get(current),
+    ]).pipe(
+      Effect.map(([queued, thread]) => queued.driver === thread.driver),
+      Effect.orElseSucceed(() => false),
+    );
+    return sameDriver ? { ...selection, instanceId: current } : selection;
+  });
+
   /** Unsupported goal controls can become new objectives in native providers. */
   const ensureGoalCommandSupported = Effect.fn("Orchestrator.ensureGoalCommandSupported")(
     function* (
@@ -2429,7 +2456,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const queuedMessage = projection.messages.find(
         (candidate) => candidate.id === storedQueuedRun.userMessageId,
       );
-      const modelSelection = queuedRunModelSelection(projection, storedQueuedRun);
+      const modelSelection = yield* aivaQueuedRunSelection(projection, storedQueuedRun);
       const queuedRun = {
         ...storedQueuedRun,
         modelSelection,
@@ -2580,7 +2607,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             }),
         ),
       );
-      const followsCurrent = followsCurrentConversation(queuedMessage);
+      const followsCurrent =
+        followsCurrentConversation(queuedMessage) ||
+        queuedRun.providerInstanceId !== storedQueuedRun.providerInstanceId;
       const freshContext = queuedRun.freshContext === true;
       const activeProviderThread = dispatchProviderThread(projection, queuedMessage, freshContext);
       const contextBoundary = freshContext ? ordinal : contextBoundaryOrdinal(projection);
@@ -15362,7 +15391,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             projection,
             nextRun === undefined
               ? projection.thread.providerInstanceId
-              : queuedRunModelSelection(projection, nextRun).instanceId,
+              : (yield* aivaQueuedRunSelection(projection, nextRun)).instanceId,
           )
         ) {
           return yield* new OrchestratorDispatchError({
