@@ -2766,9 +2766,10 @@ describe("orchestration v2 provider switching", () => {
 
   // aiva P29 (AIV-639): node-002 queues stuck for hours. "wake": a Claude wake pinned to an account
   // that ran out sat ahead of a person's message after the thread moved. "held": nothing in Aiva
-  // resumes a held queue, so it must run once the thread moves or at startup ("restart").
+  // resumes a held queue, so it runs once the thread moves or at startup. "stopped": a person's
+  // Stop on a run whose provider start failed keeps it held through both.
   it.live.each<{
-    readonly blocker: "wake" | "held";
+    readonly blocker: "wake" | "held" | "stopped";
     readonly step: "switch" | "restart";
     readonly aiva: boolean;
   }>([
@@ -2778,6 +2779,8 @@ describe("orchestration v2 provider switching", () => {
     { blocker: "held", step: "switch", aiva: false },
     { blocker: "held", step: "restart", aiva: true },
     { blocker: "held", step: "restart", aiva: false },
+    { blocker: "stopped", step: "switch", aiva: true },
+    { blocker: "stopped", step: "restart", aiva: true },
   ])(
     "a person's queued message behind a $blocker runs after a $step (aiva $aiva)",
     ({ blocker, step, aiva }) =>
@@ -2790,6 +2793,7 @@ describe("orchestration v2 provider switching", () => {
         const capturedTurns = yield* Ref.make<ReadonlyArray<CapturedTurn>>([]);
         const started = yield* Deferred.make<void>();
         const release = yield* Deferred.make<void>();
+        const failLookupOnce = yield* Ref.make(false);
         const firstSelection: ModelSelection = {
           ...CODEX_MODEL_SELECTION,
           instanceId: ProviderInstanceId.make("codex-first"),
@@ -2823,7 +2827,7 @@ describe("orchestration v2 provider switching", () => {
             capturedTurns,
             holdFirstTurn: started,
             releaseFirstTurn: release,
-            failedRunOrdinals: new Set([1]),
+            failedRunOrdinals: new Set(blocker === "stopped" ? [] : [1]),
             failure,
           }),
           makeTestAdapter({
@@ -2838,14 +2842,20 @@ describe("orchestration v2 provider switching", () => {
         const layerRegistry = Layer.succeed(
           ProviderAdapterRegistry.ProviderAdapterRegistryV2,
           ProviderAdapterRegistry.ProviderAdapterRegistryV2.of({
-            get: (instanceId) => {
-              const adapter = adapters.find((candidate) => candidate.instanceId === instanceId);
-              return adapter === undefined
-                ? Effect.fail(
-                    new ProviderAdapterRegistry.ProviderAdapterRegistryLookupError({ instanceId }),
-                  )
-                : Effect.succeed(adapter);
-            },
+            get: (instanceId) =>
+              Effect.gen(function* () {
+                const adapter = adapters.find((candidate) => candidate.instanceId === instanceId);
+                // "stopped": the queued start after the first turn can't reach its provider.
+                const lookupFails =
+                  instanceId === firstSelection.instanceId &&
+                  (yield* Ref.getAndSet(failLookupOnce, false));
+                if (adapter === undefined || lookupFails) {
+                  return yield* new ProviderAdapterRegistry.ProviderAdapterRegistryLookupError({
+                    instanceId,
+                  });
+                }
+                return adapter;
+              }),
             list: () => Effect.succeed(adapters.map((adapter) => adapter.instanceId)),
             getMetadata: (instanceId) =>
               adapters.some((candidate) => candidate.instanceId === instanceId)
@@ -2910,6 +2920,20 @@ describe("orchestration v2 provider switching", () => {
               },
             });
           }
+          if (blocker === "stopped") {
+            // Queued next, and its provider start fails.
+            yield* orchestrator.dispatch({
+              type: "message.dispatch",
+              createdBy: "agent",
+              creationSource: "mcp",
+              commandId: CommandId.make("command:queued-behind-stale-holds:unstarted"),
+              threadId: testThreadId,
+              messageId: MessageId.make("message:queued-behind-stale-holds:unstarted"),
+              text: "A turn that never starts",
+              attachments: [],
+              dispatchMode: { type: "queue_after_active" },
+            });
+          }
           // As Aiva's apps send a person's message (aiva-client `person_message`).
           yield* orchestrator.dispatch({
             type: "message.dispatch",
@@ -2922,6 +2946,7 @@ describe("orchestration v2 provider switching", () => {
             attachments: [],
             dispatchMode: { type: "queue_after_active" },
           });
+          if (blocker === "stopped") yield* Ref.set(failLookupOnce, true);
           yield* Deferred.succeed(release, undefined);
           // A usage limit leaves the queue waiting on the account; another failure holds it.
           yield* orchestrator.streamStoredEvents.pipe(
@@ -2937,6 +2962,15 @@ describe("orchestration v2 provider switching", () => {
             Stream.runHead,
           );
           yield* worker.drain();
+          if (blocker === "stopped") {
+            // The person stops the thread: its marker lands on the run that never started.
+            yield* orchestrator.dispatch({
+              type: "thread.stop",
+              commandId: CommandId.make("command:queued-behind-stale-holds:stop"),
+              threadId: testThreadId,
+            });
+            yield* worker.drain();
+          }
           if (step === "switch") {
             // The sidecar's switcher moves the thread to another account (t3_thread_configure).
             yield* orchestrator.dispatch({
@@ -2949,9 +2983,10 @@ describe("orchestration v2 provider switching", () => {
             yield* orchestrator.resumeQueuedRuns;
           }
           yield* worker.drain();
-          const settled = aiva
-            ? yield* waitForIdle(testThreadId)
-            : yield* orchestrator.getThreadProjection(testThreadId);
+          const settled =
+            aiva && blocker !== "stopped"
+              ? yield* waitForIdle(testThreadId)
+              : yield* orchestrator.getThreadProjection(testThreadId);
           yield* worker.drain();
           return settled;
         }).pipe(
@@ -2976,7 +3011,7 @@ describe("orchestration v2 provider switching", () => {
         const statusOf = (messageId: string) =>
           after.runs.find((run) => run.userMessageId === MessageId.make(messageId))?.status;
         const ranOn = step === "switch" ? nextSelection.instanceId : firstSelection.instanceId;
-        if (aiva) {
+        if (aiva && blocker !== "stopped") {
           assert.equal(statusOf("message:queued-behind-stale-holds:person"), "completed");
           if (blocker === "wake") {
             assert.equal(statusOf("message:queued-behind-stale-holds:wake"), "cancelled");
@@ -2992,7 +3027,8 @@ describe("orchestration v2 provider switching", () => {
             ],
           );
         } else {
-          // Upstream: the queue waits for someone to resume it, or for the used-up account.
+          // Upstream: the queue waits for someone to resume it, or for the used-up account; and
+          // a person's Stop keeps it held on Aiva too.
           assert.equal(statusOf("message:queued-behind-stale-holds:person"), "queued");
           assert.deepEqual(
             (yield* Ref.get(capturedTurns)).map((turn) => turn.text),

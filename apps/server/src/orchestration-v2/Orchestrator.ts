@@ -209,7 +209,11 @@ import {
   aivaFailsMessagesAfterFailedSetup,
   aivaLatestExecutedRun,
 } from "../aiva/retryFailedSetup.ts";
-import { aivaReleasesQueueHolds, staleBufferedWakes } from "../aiva/queueHolds.ts";
+import {
+  aivaReleasesQueueHolds,
+  staleBufferedWakes,
+  stoppedSinceLastStart,
+} from "../aiva/queueHolds.ts";
 
 const isMessageQuestionAnswer = Schema.is(
   Schema.Union([TrimmedNonEmptyString, Schema.NonEmptyArray(TrimmedNonEmptyString)]),
@@ -3333,18 +3337,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       return;
     const now = yield* DateTime.now;
     if (usageLimitHoldsQueue(projection, projection.thread.modelSelection.instanceId, now)) return;
+    // A restart continuation still to come goes first; its completion releases the rest.
     const latest = aivaLatestExecutedRun(projection.runs);
-    if (latest !== null) {
-      // A restart continuation still to come goes first; its completion releases the rest.
-      if (options?.unlessContinuing === true && (yield* awaitsRestartContinuation(latest))) return;
-      const stopped = yield* projectionStore
-        .getThreadRecords(threadId, ["turnItems"], {
-          turnItemTypes: ["run_interrupt_request"],
-          turnItemRunIds: [latest.id],
-        })
-        .pipe(Effect.map(({ turnItems }) => turnItems.length > 0));
-      if (stopped) return;
+    if (latest !== null && options?.unlessContinuing === true) {
+      if (yield* awaitsRestartContinuation(latest)) return;
     }
+    const { turnItems: stops } = yield* projectionStore.getThreadRecords(threadId, ["turnItems"], {
+      turnItemTypes: ["run_interrupt_request"],
+    });
+    if (stoppedSinceLastStart(projection.runs, stops)) return;
     yield* Effect.logInfo("Releasing a held queue nobody can resume", {
       threadId,
       runIds: held.map((run) => run.id),
