@@ -46,6 +46,7 @@ import * as AgentAwarenessRelay from "./relay/AgentAwarenessRelay.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as ServerSettings from "./serverSettings.ts";
 import { forkParked, forkParkedFiber } from "./serverActivation.ts";
+import { aivaReleasesQueueHolds } from "./aiva/queueHolds.ts";
 import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
 import { getServerOwners } from "./telemetry/Identify.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
@@ -574,6 +575,16 @@ const make = Effect.fn("serverRuntimeStartup.make")(function* (options?: Startup
       ).pipe(Effect.map((targets): AutoBootstrapWelcomeTargets => targets)),
     });
     yield* Effect.logInfo("V2 orchestration recovery completed", recovery);
+    // aiva P29 (AIV-639): recovery holds every queue; nothing in Aiva resumes one by hand.
+    if (aivaReleasesQueueHolds()) {
+      yield* runStartupPhase("aiva.queued-runs.resume", orchestrator.resumeQueuedRuns).pipe(
+        Effect.tap((resumed) => Effect.logInfo("Resumed queues held by the restart", { resumed })),
+        Effect.catch((cause) =>
+          Effect.logWarning("Failed to resume queues held by the restart", { cause }),
+        ),
+        forkParked,
+      );
+    }
     // Runs after activation: the status check fetches every enabled project's
     // remote, and awaiting it here held command readiness for that long.
     yield* runStartupPhase(
