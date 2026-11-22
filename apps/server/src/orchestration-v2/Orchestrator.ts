@@ -214,6 +214,7 @@ import {
   staleBufferedWakes,
   stoppedSinceLastStart,
 } from "../aiva/queueHolds.ts";
+import { aivaFailedBeforeStart } from "../aiva/startFailure.ts";
 
 const isMessageQuestionAnswer = Schema.is(
   Schema.Union([TrimmedNonEmptyString, Schema.NonEmptyArray(TrimmedNonEmptyString)]),
@@ -2479,7 +2480,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       // Failed worktree creation would run queued work in the project checkout; wait for the user.
       const failedRun = latestExecutedRun(projection.runs);
       const failureClass =
-        failedRun?.id === options?.failedRunId
+        failedRun?.id === options?.failedRunId && !aivaFailedBeforeStart(failedRun)
           ? latestRootProviderFailure(failedRun, projection.turnItems)?.class
           : undefined;
       const worktreeMissing =
