@@ -30,6 +30,7 @@ import { mergeGitStatusParts } from "@t3tools/shared/git";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 
+import { AivaStatusRefreshWindow, makeAivaSharedStatusRefresh } from "../aiva/sharedGitStatus.ts";
 import * as BackgroundPolicy from "../background/BackgroundPolicy.ts";
 import * as GitWorkflowService from "../git/GitWorkflowService.ts";
 import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
@@ -465,11 +466,19 @@ export const make = Effect.gen(function* () {
     },
   );
 
+  // P32: turn ends and app refreshes from every session in a checkout share its reads.
+  const aivaSharedLocalStatus = makeAivaSharedStatusRefresh({
+    window: yield* AivaStatusRefreshWindow,
+    scope: broadcasterScope,
+    refresh: refreshLocalStatusCore,
+    currentBranch: workflow.currentBranch,
+  });
+
   const refreshLocalStatus: VcsStatusBroadcaster["Service"]["refreshLocalStatus"] = Effect.fn(
     "VcsStatusBroadcaster.refreshLocalStatus",
   )(function* (rawCwd) {
     const cwd = yield* withFileSystem(normalizeCwd(rawCwd));
-    const local = yield* refreshLocalStatusCore(cwd);
+    const local = yield* aivaSharedLocalStatus.refresh(cwd);
     const cached = yield* getCachedStatus(cwd);
     // Divergence is local Git data; a slow forge lookup must not delay turn-end updates.
     if (cached?.remote?.value?.hasUpstream) {
@@ -607,7 +616,7 @@ export const make = Effect.gen(function* () {
     "VcsStatusBroadcaster.refreshStatus",
   )(function* (rawCwd, options) {
     const cwd = yield* withFileSystem(normalizeCwd(rawCwd));
-    yield* refreshLocalStatusCore(cwd);
+    yield* aivaSharedLocalStatus.refresh(cwd);
     if (options?.localOnly) {
       // Never cache a remote here: readers take `value: null` as "read and found no PR".
       const parts = yield* getStatusParts(cwd);
@@ -621,7 +630,7 @@ export const make = Effect.gen(function* () {
         yield* workflow.invalidateStatus(cwd);
         const remoteRead = yield* readRemoteStatus(cwd, { refreshUpstream });
         // Fetch can move the base used for local Changes totals.
-        yield* refreshLocalStatusCore(cwd);
+        yield* aivaSharedLocalStatus.refresh(cwd);
         // Without a fetch, the cached behind count cannot justify an automatic pull.
         const pulled = refreshUpstream ? yield* maybeAutoPull(cwd, remoteRead, [rawCwd]) : null;
         if (pulled !== null) return mergeGitStatusParts(pulled.local, pulled.remote);
