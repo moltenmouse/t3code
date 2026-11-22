@@ -14,6 +14,8 @@ import type * as Scope from "effect/Scope";
 import { loadAivaSettings } from "./settings.ts";
 
 export const AIVA_STATUS_REFRESH_WINDOW = Duration.seconds(5);
+export const AIVA_STATUS_RETRY_DELAY = Duration.seconds(2);
+const AIVA_STATUS_RETRY_MAX_DELAY = Duration.seconds(30);
 
 export class AivaStatusRefreshWindow extends Context.Reference<() => Duration.Duration>(
   "t3/aiva/AivaStatusRefreshWindow",
@@ -55,6 +57,7 @@ export function makeAivaSharedStatusRefresh<
     Effect.uninterruptible(
       Effect.gen(function* () {
         const done = yield* Deferred.make<A, E>();
+        const pending = shared.stale;
         shared.inFlight = done;
         shared.stale = false;
         yield* options.refresh(cwd).pipe(
@@ -63,6 +66,9 @@ export function makeAivaSharedStatusRefresh<
               shared.inFlight = null;
               if (Exit.isSuccess(exit)) {
                 shared.last = { finishedAt: yield* Clock.currentTimeMillis, value: exit.value };
+              } else if (pending) {
+                // A held index.lock fails a read; the catch-up it owed stays owed.
+                shared.stale = true;
               }
               yield* Deferred.done(done, exit);
             }),
@@ -81,6 +87,7 @@ export function makeAivaSharedStatusRefresh<
     if (shared.trailing) return;
     shared.trailing = true;
     yield* Effect.gen(function* () {
+      let failures = 0;
       while (true) {
         if (shared.inFlight !== null) {
           yield* Deferred.await(shared.inFlight).pipe(Effect.ignore);
@@ -92,11 +99,30 @@ export function makeAivaSharedStatusRefresh<
             : shared.last.finishedAt +
               Duration.toMillis(options.window()) -
               (yield* Clock.currentTimeMillis);
-        if (due <= 0) break;
-        yield* Effect.sleep(Duration.millis(due));
+        if (due > 0) {
+          yield* Effect.sleep(Duration.millis(due));
+          continue;
+        }
+        if (!shared.stale) break;
+        const exit = yield* Effect.exit(Deferred.await(yield* start(cwd, shared)));
+        if (Exit.isSuccess(exit)) {
+          failures = 0;
+          continue;
+        }
+        failures += 1;
+        if (failures === 1) {
+          yield* Effect.logWarning("Shared git status catch-up read failed", {
+            cwdLength: cwd.length,
+          });
+        }
+        yield* Effect.sleep(
+          Duration.min(
+            Duration.times(AIVA_STATUS_RETRY_DELAY, 2 ** (failures - 1)),
+            AIVA_STATUS_RETRY_MAX_DELAY,
+          ),
+        );
       }
       shared.trailing = false;
-      if (shared.stale) yield* Deferred.await(yield* start(cwd, shared));
     }).pipe(Effect.ignoreCause({ log: true }), Effect.forkIn(options.scope));
   });
 

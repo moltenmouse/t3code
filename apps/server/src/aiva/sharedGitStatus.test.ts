@@ -1,5 +1,6 @@
 import { assert, describe, it } from "@effect/vitest";
 import type { VcsStatusLocalResult, VcsStatusStreamEvent } from "@t3tools/contracts";
+import { GitManagerError } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -14,7 +15,11 @@ import * as TestClock from "effect/testing/TestClock";
 import * as BackgroundPolicy from "../background/BackgroundPolicy.ts";
 import * as GitWorkflowService from "../git/GitWorkflowService.ts";
 import * as VcsStatusBroadcaster from "../vcs/VcsStatusBroadcaster.ts";
-import { AIVA_STATUS_REFRESH_WINDOW, AivaStatusRefreshWindow } from "./sharedGitStatus.ts";
+import {
+  AIVA_STATUS_REFRESH_WINDOW,
+  AIVA_STATUS_RETRY_DELAY,
+  AivaStatusRefreshWindow,
+} from "./sharedGitStatus.ts";
 
 const SESSIONS = 137;
 
@@ -31,6 +36,7 @@ interface GitState {
   status: VcsStatusLocalResult;
   reads: number;
   beforeRead?: Effect.Effect<void> | undefined;
+  failingReads?: number;
 }
 
 function layerFor(state: GitState, window?: Duration.Duration) {
@@ -57,6 +63,16 @@ function layerFor(state: GitState, window?: Duration.Duration) {
         localStatus: () =>
           Effect.suspend(() => {
             state.reads += 1;
+            if ((state.failingReads ?? 0) > 0) {
+              state.failingReads = (state.failingReads ?? 0) - 1;
+              return Effect.fail(
+                new GitManagerError({
+                  operation: "sharedGitStatus.test",
+                  cwd: "/repo",
+                  detail: "index.lock is held",
+                }),
+              );
+            }
             const status = state.status;
             return (state.beforeRead ?? Effect.void).pipe(Effect.as(status));
           }),
@@ -132,6 +148,35 @@ describe("P32 shared git status", () => {
       yield* broadcaster.refreshLocalStatus("/repo");
       assert.equal(state.reads - subscriberRead, 5);
     }).pipe(Effect.provide(layerFor(state, Duration.seconds(5))));
+  });
+
+  it.effect("a failed catch-up read is retried until subscribers get the fresh status", () => {
+    const state: GitState = { status: cleanStatus, reads: 0 };
+    return Effect.gen(function* () {
+      const broadcaster = yield* VcsStatusBroadcaster.VcsStatusBroadcaster;
+      const published = yield* Queue.unbounded<VcsStatusStreamEvent>();
+      yield* broadcaster.streamStatus({ cwd: "/repo", includeRemote: false }).pipe(
+        Stream.runForEach((event) => Queue.offer(published, event)),
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      assert.equal((yield* Queue.take(published))._tag, "snapshot");
+      yield* broadcaster.refreshLocalStatus("/repo");
+      const readsBefore = state.reads;
+
+      // A turn ends inside the window and gets the last read; its catch-up hits a held index.lock.
+      state.status = { ...cleanStatus, hasWorkingTreeChanges: true };
+      assert.isFalse((yield* broadcaster.refreshLocalStatus("/repo")).hasWorkingTreeChanges);
+      state.failingReads = 1;
+      yield* TestClock.adjust(AIVA_STATUS_REFRESH_WINDOW);
+      yield* TestClock.adjust(AIVA_STATUS_RETRY_DELAY);
+      const fresh = yield* Queue.take(published);
+      assert.isTrue(fresh._tag === "localUpdated" && fresh.local.hasWorkingTreeChanges);
+      assert.equal(state.reads - readsBefore, 2);
+
+      // Caught up, the retries stop.
+      yield* TestClock.adjust(Duration.minutes(5));
+      assert.equal(state.reads - readsBefore, 2);
+    }).pipe(Effect.provide(layerFor(state, AIVA_STATUS_REFRESH_WINDOW)));
   });
 
   it.effect("without aiva.json every refresh reads git status", () => {
