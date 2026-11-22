@@ -56,6 +56,7 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import { aivaSettleOwedMcpReset } from "../aiva/mcpReset.ts";
+import { aivaFailsUnstartedRuns, aivaFailUnstartedRun } from "../aiva/startFailure.ts";
 import {
   ContextHandoffBackgroundWorkError,
   knownProviderFailureMessage,
@@ -1825,6 +1826,26 @@ export const layer: Layer.Layer<
               isProviderTurnStartError(cause)
                 ? cause
                 : new ProviderTurnStartError({ runId: input.runId, cause }),
+            ),
+            // Aiva P31: a start out of attempts fails its run instead of leaving it starting.
+            Effect.tapError((error) =>
+              input.willRetry === true || !aivaFailsUnstartedRuns()
+                ? Effect.void
+                : aivaFailUnstartedRun({
+                    projectionStore,
+                    eventSink,
+                    idAllocator,
+                    threadId: input.threadId,
+                    runId: input.runId,
+                    error,
+                  }).pipe(
+                    Effect.catchCause((cause) =>
+                      Effect.logWarning("aiva.start-failure.settle-failed", {
+                        runId: input.runId,
+                        cause,
+                      }),
+                    ),
+                  ),
             ),
           ),
       ),

@@ -2976,13 +2976,13 @@ describe("orchestration v2 provider switching", () => {
       }),
   );
 
-  // aiva P29 (AIV-639): node-002 queues stuck for hours. "wake": a Claude wake pinned to an account
-  // that ran out sat ahead of a person's message after the thread moved. "held": nothing in Aiva
-  // resumes a held queue, so it runs once the thread moves or at startup. "stopped": a person's
-  // Stop on a run whose provider start failed keeps it held through both.
+  // aiva P29/P31: "wake": a Claude wake pinned to a used-up account the thread left. "held": nothing
+  // in Aiva resumes a held queue, so the move or startup must. "stopped": a Stop on a run still
+  // starting keeps the hold through both. "unreadable"/"prepared": every read of a queued start fails
+  // (node-002's full disk), also after a worktree was prepared: the run fails, the queue moves on.
   it.live.each<{
-    readonly blocker: "wake" | "held" | "stopped";
-    readonly step: "switch" | "restart";
+    readonly blocker: "wake" | "held" | "stopped" | "unreadable" | "prepared";
+    readonly step: "switch" | "restart" | "none";
     readonly aiva: boolean;
   }>([
     { blocker: "wake", step: "switch", aiva: true },
@@ -2993,8 +2993,11 @@ describe("orchestration v2 provider switching", () => {
     { blocker: "held", step: "restart", aiva: false },
     { blocker: "stopped", step: "switch", aiva: true },
     { blocker: "stopped", step: "restart", aiva: true },
+    { blocker: "unreadable", step: "none", aiva: true },
+    { blocker: "unreadable", step: "none", aiva: false },
+    { blocker: "prepared", step: "none", aiva: true },
   ])(
-    "a person's queued message behind a $blocker runs after a $step (aiva $aiva)",
+    "a person's queued message behind a $blocker runs ($step, aiva $aiva)",
     ({ blocker, step, aiva }) =>
       Effect.gen(function* () {
         yield* Effect.acquireRelease(
@@ -3005,7 +3008,41 @@ describe("orchestration v2 provider switching", () => {
         const capturedTurns = yield* Ref.make<ReadonlyArray<CapturedTurn>>([]);
         const started = yield* Deferred.make<void>();
         const release = yield* Deferred.make<void>();
-        const failLookupOnce = yield* Ref.make(false);
+        const unstartedMessageId = MessageId.make("message:queued-behind-stale-holds:unstarted");
+        const unstartedReading = yield* Deferred.make<void>();
+        const stopped = yield* Deferred.make<void>();
+        const unstartedReads = yield* Ref.make(0);
+        const everyAttemptFailed = yield* Deferred.make<void>();
+        // EffectWorker.layer's attempts; a read after them (P31 failing the run) succeeds.
+        const startAttempts = 5;
+        const wrapProjectionStore = (
+          store: ProjectionStore.ProjectionStoreV2Shape,
+        ): ProjectionStore.ProjectionStoreV2Shape => ({
+          ...store,
+          getTurnStartContext: (contextThreadId, runId) =>
+            store.getTurnStartContext(contextThreadId, runId).pipe(
+              Effect.tap((context) =>
+                Effect.gen(function* () {
+                  const run = context.runs.find((candidate) => candidate.id === runId);
+                  if (run?.userMessageId !== unstartedMessageId) return;
+                  if (blocker === "stopped") {
+                    yield* Deferred.succeed(unstartedReading, undefined);
+                    yield* Deferred.await(stopped);
+                    return;
+                  }
+                  if (blocker !== "unreadable" && blocker !== "prepared") return;
+                  const reads = yield* Ref.updateAndGet(unstartedReads, (count) => count + 1);
+                  if (reads > startAttempts) return;
+                  if (reads === startAttempts)
+                    yield* Deferred.succeed(everyAttemptFailed, undefined);
+                  return yield* new ProjectionStore.ProjectionStoreReadError({
+                    threadId: contextThreadId,
+                    cause: new Error("database or disk is full"),
+                  });
+                }),
+              ),
+            ),
+        });
         const firstSelection: ModelSelection = {
           ...CODEX_MODEL_SELECTION,
           instanceId: ProviderInstanceId.make("codex-first"),
@@ -3039,7 +3076,7 @@ describe("orchestration v2 provider switching", () => {
             capturedTurns,
             holdFirstTurn: started,
             releaseFirstTurn: release,
-            failedRunOrdinals: new Set(blocker === "stopped" ? [] : [1]),
+            failedRunOrdinals: new Set(blocker === "wake" || blocker === "held" ? [1] : []),
             failure,
           }),
           makeTestAdapter({
@@ -3054,20 +3091,14 @@ describe("orchestration v2 provider switching", () => {
         const layerRegistry = Layer.succeed(
           ProviderAdapterRegistry.ProviderAdapterRegistryV2,
           ProviderAdapterRegistry.ProviderAdapterRegistryV2.of({
-            get: (instanceId) =>
-              Effect.gen(function* () {
-                const adapter = adapters.find((candidate) => candidate.instanceId === instanceId);
-                // "stopped": the queued start after the first turn can't reach its provider.
-                const lookupFails =
-                  instanceId === firstSelection.instanceId &&
-                  (yield* Ref.getAndSet(failLookupOnce, false));
-                if (adapter === undefined || lookupFails) {
-                  return yield* new ProviderAdapterRegistry.ProviderAdapterRegistryLookupError({
-                    instanceId,
-                  });
-                }
-                return adapter;
-              }),
+            get: (instanceId) => {
+              const adapter = adapters.find((candidate) => candidate.instanceId === instanceId);
+              return adapter === undefined
+                ? Effect.fail(
+                    new ProviderAdapterRegistry.ProviderAdapterRegistryLookupError({ instanceId }),
+                  )
+                : Effect.succeed(adapter);
+            },
             list: () => Effect.succeed(adapters.map((adapter) => adapter.instanceId)),
             getMetadata: (instanceId) =>
               adapters.some((candidate) => candidate.instanceId === instanceId)
@@ -3132,22 +3163,22 @@ describe("orchestration v2 provider switching", () => {
               },
             });
           }
-          if (blocker === "stopped") {
-            // Queued next, and its provider start fails.
+          if (blocker === "stopped" || blocker === "unreadable") {
+            // Queued next; its provider start never gets past reading the thread.
             yield* orchestrator.dispatch({
               type: "message.dispatch",
               createdBy: "agent",
               creationSource: "mcp",
               commandId: CommandId.make("command:queued-behind-stale-holds:unstarted"),
               threadId: testThreadId,
-              messageId: MessageId.make("message:queued-behind-stale-holds:unstarted"),
+              messageId: unstartedMessageId,
               text: "A turn that never starts",
               attachments: [],
               dispatchMode: { type: "queue_after_active" },
             });
           }
           // As Aiva's apps send a person's message (aiva-client `person_message`).
-          yield* orchestrator.dispatch({
+          const sendPersonMessage = orchestrator.dispatch({
             type: "message.dispatch",
             createdBy: "user",
             creationSource: "web",
@@ -3158,31 +3189,65 @@ describe("orchestration v2 provider switching", () => {
             attachments: [],
             dispatchMode: { type: "queue_after_active" },
           });
-          if (blocker === "stopped") yield* Ref.set(failLookupOnce, true);
+          if (blocker !== "prepared") yield* sendPersonMessage;
           yield* Deferred.succeed(release, undefined);
-          // A usage limit leaves the queue waiting on the account; another failure holds it.
-          yield* orchestrator.streamStoredEvents.pipe(
-            Stream.filter(
-              (event) =>
-                event.event.type === "run.updated" &&
-                (blocker === "wake"
-                  ? event.event.payload.ordinal === 1 && event.event.payload.status === "failed"
-                  : event.event.payload.userMessageId ===
-                      MessageId.make("message:queued-behind-stale-holds:person") &&
-                    event.event.payload.queueHeld === true),
-            ),
-            Stream.runHead,
-          );
-          yield* worker.drain();
           if (blocker === "stopped") {
             // The person stops the thread: its marker lands on the run that never started.
+            yield* Deferred.await(unstartedReading);
             yield* orchestrator.dispatch({
               type: "thread.stop",
               commandId: CommandId.make("command:queued-behind-stale-holds:stop"),
               threadId: testThreadId,
             });
-            yield* worker.drain();
+            yield* Deferred.succeed(stopped, undefined);
+          } else if (blocker === "unreadable") {
+            yield* Deferred.await(everyAttemptFailed);
+          } else if (blocker === "prepared") {
+            // A message launched into a new worktree, with the person's queued behind it.
+            yield* waitForIdle(testThreadId);
+            yield* orchestrator.dispatch({
+              type: "message.dispatch",
+              createdBy: "agent",
+              creationSource: "mcp",
+              commandId: CommandId.make("command:queued-behind-stale-holds:unstarted"),
+              threadId: testThreadId,
+              messageId: unstartedMessageId,
+              text: "A turn that never starts",
+              attachments: [],
+              dispatchMode: {
+                type: "defer_start",
+                workspaceStrategy: { type: "worktree", baseRef: "main" },
+              },
+            });
+            yield* sendPersonMessage;
+            const prepared = (yield* orchestrator.getThreadProjection(testThreadId)).runs.find(
+              (run) => run.userMessageId === unstartedMessageId,
+            );
+            assert.equal(prepared?.status, "preparing");
+            // As ThreadLaunchService does once the worktree is ready.
+            yield* orchestrator.dispatch({
+              type: "prepared-run.release",
+              commandId: CommandId.make("command:queued-behind-stale-holds:prepared"),
+              threadId: testThreadId,
+              runId: prepared!.id,
+            });
+            yield* Deferred.await(everyAttemptFailed);
+          } else {
+            // A usage limit leaves the queue waiting on the account; another failure holds it.
+            yield* orchestrator.streamStoredEvents.pipe(
+              Stream.filter(
+                (event) =>
+                  event.event.type === "run.updated" &&
+                  (blocker === "wake"
+                    ? event.event.payload.ordinal === 1 && event.event.payload.status === "failed"
+                    : event.event.payload.userMessageId ===
+                        MessageId.make("message:queued-behind-stale-holds:person") &&
+                      event.event.payload.queueHeld === true),
+              ),
+              Stream.runHead,
+            );
           }
+          yield* worker.drain();
           if (step === "switch") {
             // The sidecar's switcher moves the thread to another account (t3_thread_configure).
             yield* orchestrator.dispatch({
@@ -3191,7 +3256,7 @@ describe("orchestration v2 provider switching", () => {
               threadId: testThreadId,
               modelSelection: nextSelection,
             });
-          } else {
+          } else if (step === "restart") {
             yield* orchestrator.resumeQueuedRuns;
           }
           yield* worker.drain();
@@ -3217,12 +3282,17 @@ describe("orchestration v2 provider switching", () => {
                 },
               },
               layerRegistry,
+              { wrapProjectionStore },
             ),
           ),
         );
         const statusOf = (messageId: string) =>
           after.runs.find((run) => run.userMessageId === MessageId.make(messageId))?.status;
         const ranOn = step === "switch" ? nextSelection.instanceId : firstSelection.instanceId;
+        if (blocker === "unreadable" || blocker === "prepared") {
+          // Upstream leaves it starting for good, and nothing behind it starts.
+          assert.equal(statusOf(unstartedMessageId), aiva ? "failed" : "starting");
+        }
         if (aiva && blocker !== "stopped") {
           assert.equal(statusOf("message:queued-behind-stale-holds:person"), "completed");
           if (blocker === "wake") {
@@ -3231,7 +3301,8 @@ describe("orchestration v2 provider switching", () => {
           assert.deepEqual(
             (yield* Ref.get(capturedTurns)).map((turn) => [
               turn.modelSelection.instanceId,
-              turn.text,
+              // "unreadable": the failed run's handoff comes first, as after any failed run.
+              turn.text.slice(turn.text.lastIndexOf("\n") + 1),
             ]),
             [
               [firstSelection.instanceId, "The first turn"],
