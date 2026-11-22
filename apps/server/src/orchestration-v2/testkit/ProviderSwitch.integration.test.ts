@@ -2977,11 +2977,11 @@ describe("orchestration v2 provider switching", () => {
   );
 
   // aiva P29/P31: "wake": a Claude wake pinned to a used-up account the thread left. "held": nothing
-  // in Aiva resumes a held queue, so the move or startup must. "stopped": a person's Stop on a run
-  // still starting keeps the hold through both. "unreadable": every read of a queued start fails
-  // (node-002's full disk), so the run must fail rather than stay starting ahead of the queue.
+  // in Aiva resumes a held queue, so the move or startup must. "stopped": a Stop on a run still
+  // starting keeps the hold through both. "unreadable"/"prepared": every read of a queued start fails
+  // (node-002's full disk), also after a worktree was prepared: the run fails, the queue moves on.
   it.live.each<{
-    readonly blocker: "wake" | "held" | "stopped" | "unreadable";
+    readonly blocker: "wake" | "held" | "stopped" | "unreadable" | "prepared";
     readonly step: "switch" | "restart" | "none";
     readonly aiva: boolean;
   }>([
@@ -2995,6 +2995,7 @@ describe("orchestration v2 provider switching", () => {
     { blocker: "stopped", step: "restart", aiva: true },
     { blocker: "unreadable", step: "none", aiva: true },
     { blocker: "unreadable", step: "none", aiva: false },
+    { blocker: "prepared", step: "none", aiva: true },
   ])(
     "a person's queued message behind a $blocker runs ($step, aiva $aiva)",
     ({ blocker, step, aiva }) =>
@@ -3029,7 +3030,7 @@ describe("orchestration v2 provider switching", () => {
                     yield* Deferred.await(stopped);
                     return;
                   }
-                  if (blocker !== "unreadable") return;
+                  if (blocker !== "unreadable" && blocker !== "prepared") return;
                   const reads = yield* Ref.updateAndGet(unstartedReads, (count) => count + 1);
                   if (reads > startAttempts) return;
                   if (reads === startAttempts)
@@ -3177,7 +3178,7 @@ describe("orchestration v2 provider switching", () => {
             });
           }
           // As Aiva's apps send a person's message (aiva-client `person_message`).
-          yield* orchestrator.dispatch({
+          const sendPersonMessage = orchestrator.dispatch({
             type: "message.dispatch",
             createdBy: "user",
             creationSource: "web",
@@ -3188,6 +3189,7 @@ describe("orchestration v2 provider switching", () => {
             attachments: [],
             dispatchMode: { type: "queue_after_active" },
           });
+          if (blocker !== "prepared") yield* sendPersonMessage;
           yield* Deferred.succeed(release, undefined);
           if (blocker === "stopped") {
             // The person stops the thread: its marker lands on the run that never started.
@@ -3199,6 +3201,36 @@ describe("orchestration v2 provider switching", () => {
             });
             yield* Deferred.succeed(stopped, undefined);
           } else if (blocker === "unreadable") {
+            yield* Deferred.await(everyAttemptFailed);
+          } else if (blocker === "prepared") {
+            // A message launched into a new worktree, with the person's queued behind it.
+            yield* waitForIdle(testThreadId);
+            yield* orchestrator.dispatch({
+              type: "message.dispatch",
+              createdBy: "agent",
+              creationSource: "mcp",
+              commandId: CommandId.make("command:queued-behind-stale-holds:unstarted"),
+              threadId: testThreadId,
+              messageId: unstartedMessageId,
+              text: "A turn that never starts",
+              attachments: [],
+              dispatchMode: {
+                type: "defer_start",
+                workspaceStrategy: { type: "worktree", baseRef: "main" },
+              },
+            });
+            yield* sendPersonMessage;
+            const prepared = (yield* orchestrator.getThreadProjection(testThreadId)).runs.find(
+              (run) => run.userMessageId === unstartedMessageId,
+            );
+            assert.equal(prepared?.status, "preparing");
+            // As ThreadLaunchService does once the worktree is ready.
+            yield* orchestrator.dispatch({
+              type: "prepared-run.release",
+              commandId: CommandId.make("command:queued-behind-stale-holds:prepared"),
+              threadId: testThreadId,
+              runId: prepared!.id,
+            });
             yield* Deferred.await(everyAttemptFailed);
           } else {
             // A usage limit leaves the queue waiting on the account; another failure holds it.
@@ -3257,7 +3289,7 @@ describe("orchestration v2 provider switching", () => {
         const statusOf = (messageId: string) =>
           after.runs.find((run) => run.userMessageId === MessageId.make(messageId))?.status;
         const ranOn = step === "switch" ? nextSelection.instanceId : firstSelection.instanceId;
-        if (blocker === "unreadable") {
+        if (blocker === "unreadable" || blocker === "prepared") {
           // Upstream leaves it starting for good, and nothing behind it starts.
           assert.equal(statusOf(unstartedMessageId), aiva ? "failed" : "starting");
         }

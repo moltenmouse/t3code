@@ -4,13 +4,15 @@
  * attempt of a queued start's projection read within four seconds; the effect gave up, the run
  * stayed "starting" for 37 minutes until a person pressed Stop, and 21 messages waited behind it.
  */
-import type {
-  OrchestrationV2DomainEvent,
-  OrchestrationV2Run,
-  OrchestrationV2TurnItem,
-  RunId,
-  ThreadId,
+import {
+  ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE,
+  type OrchestrationV2DomainEvent,
+  type OrchestrationV2Run,
+  type OrchestrationV2TurnItem,
+  type RunId,
+  type ThreadId,
 } from "@t3tools/contracts";
+import { latestRootProviderFailure } from "@t3tools/shared/orchestrationV2ThreadError";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import type * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as DateTime from "effect/DateTime";
@@ -24,15 +26,18 @@ export const aivaFailsUnstartedRuns = (enabled: boolean = loadAivaSettings() !==
   enabled;
 
 /** Upstream holds the queue after a failure; one that came before the provider took the prompt
- * says nothing about the messages behind it, and Aiva never resumes a held queue. */
+ * says nothing about the messages behind it, and Aiva never resumes a held queue. A failed
+ * workspace preparation still holds: a run that prepared its worktree keeps the strategy. */
 export function aivaFailedBeforeStart(
-  run: Pick<OrchestrationV2Run, "status" | "startedAt" | "workspacePreparation"> | null,
+  run: OrchestrationV2Run | null,
+  turnItems: Parameters<typeof latestRootProviderFailure>[1],
 ): boolean {
   return (
     aivaFailsUnstartedRuns() &&
     run?.status === "failed" &&
     run.startedAt === null &&
-    run.workspacePreparation === undefined
+    latestRootProviderFailure(run, turnItems)?.code !==
+      ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE
   );
 }
 

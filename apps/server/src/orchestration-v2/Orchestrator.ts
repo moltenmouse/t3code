@@ -2480,7 +2480,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       // Failed worktree creation would run queued work in the project checkout; wait for the user.
       const failedRun = latestExecutedRun(projection.runs);
       const failureClass =
-        failedRun?.id === options?.failedRunId && !aivaFailedBeforeStart(failedRun)
+        failedRun?.id === options?.failedRunId &&
+        !aivaFailedBeforeStart(failedRun, projection.turnItems)
           ? latestRootProviderFailure(failedRun, projection.turnItems)?.class
           : undefined;
       const worktreeMissing =
