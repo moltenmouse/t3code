@@ -2976,6 +2976,386 @@ describe("orchestration v2 provider switching", () => {
       }),
   );
 
+  // aiva P33 (AIV-655): sends to an idle thread on a used-up account (node-002: 32 failed runs)
+  // wait in the queue, and run in order once the thread moves (ending its background agent) or
+  // once the sidecar resumes the queue on an account that has usage again.
+  it.live.each<{ readonly aiva: boolean; readonly release: "move" | "resume" }>([
+    { aiva: true, release: "move" },
+    { aiva: false, release: "move" },
+    { aiva: true, release: "resume" },
+  ])(
+    "queues messages sent to an idle thread out of usage until it moves or resumes (%o)",
+    ({ aiva, release }) =>
+      Effect.gen(function* () {
+        yield* Effect.acquireRelease(
+          Effect.sync(() => useAivaSettings(aiva)),
+          (restore) => Effect.sync(restore),
+        );
+        const key = `limited-sends-${release}-${aiva}`;
+        const cwd = yield* checkpointWorkspace(key);
+        const capturedTurns = yield* Ref.make<ReadonlyArray<CapturedTurn>>([]);
+        const backgroundWork = yield* Ref.make(false);
+        const closedSessions = yield* Ref.make<ReadonlyArray<string>>([]);
+        const started = yield* Deferred.make<void>();
+        const releaseFirst = yield* Deferred.make<void>();
+        const usedUp: ModelSelection = {
+          ...CLAUDE_MODEL_SELECTION,
+          instanceId: ProviderInstanceId.make("claude-used-up"),
+        };
+        const roomy: ModelSelection = {
+          ...CLAUDE_MODEL_SELECTION,
+          instanceId: ProviderInstanceId.make("claude-roomy"),
+        };
+        const resetAt = DateTime.formatIso(DateTime.add(yield* DateTime.now, { minutes: 50 }));
+        const adapters = [
+          makeTestAdapter({
+            instanceId: usedUp.instanceId,
+            driver: CLAUDE_DRIVER,
+            capabilities: ClaudeProviderCapabilitiesV2,
+            modelSelection: usedUp,
+            responseByRunOrdinal: {},
+            capturedTurns,
+            backgroundWork,
+            closedSessions,
+            holdFirstTurn: started,
+            releaseFirstTurn: releaseFirst,
+            // Out of usage: every turn that starts here fails, until the sidecar resumes it.
+            failedRunOrdinals: new Set(release === "move" ? [1, 2, 3, 4] : [1]),
+            failure: makeProviderFailure({
+              message: "Claude usage limit reached. Send the message again once the limit resets.",
+              code: "rate_limit_error",
+              class: "usage_limit",
+              retryable: true,
+              resetAt,
+            }),
+          }),
+          makeTestAdapter({
+            instanceId: roomy.instanceId,
+            driver: CLAUDE_DRIVER,
+            capabilities: ClaudeProviderCapabilitiesV2,
+            modelSelection: roomy,
+            responseByRunOrdinal: {},
+            capturedTurns,
+          }),
+        ];
+        // Aiva's Claude accounts share one folder, so a thread keeps its history when it moves.
+        const layerRegistry = Layer.succeed(
+          ProviderAdapterRegistry.ProviderAdapterRegistryV2,
+          ProviderAdapterRegistry.ProviderAdapterRegistryV2.of({
+            get: (instanceId) => {
+              const adapter = adapters.find((candidate) => candidate.instanceId === instanceId);
+              return adapter === undefined
+                ? Effect.fail(
+                    new ProviderAdapterRegistry.ProviderAdapterRegistryLookupError({ instanceId }),
+                  )
+                : Effect.succeed(adapter);
+            },
+            list: () => Effect.succeed(adapters.map((adapter) => adapter.instanceId)),
+            getMetadata: (instanceId) =>
+              adapters.some((candidate) => candidate.instanceId === instanceId)
+                ? Effect.succeed({
+                    driver: CLAUDE_DRIVER,
+                    continuationKey: "claude:shared-native-account-history",
+                    enabled: true,
+                    capabilities: ClaudeProviderCapabilitiesV2,
+                  })
+                : Effect.fail(
+                    new ProviderAdapterRegistry.ProviderAdapterRegistryLookupError({ instanceId }),
+                  ),
+          }),
+        );
+        const limitedThreadId = ThreadId.make(`thread:${key}`);
+        const send = (
+          id: string,
+          text: string,
+          from: "user" | "agent",
+        ): OrchestrationV2Command => ({
+          type: "message.dispatch",
+          createdBy: from,
+          creationSource: from === "user" ? "web" : "mcp",
+          commandId: CommandId.make(`command:${key}:${id}`),
+          threadId: limitedThreadId,
+          messageId: MessageId.make(`message:${key}:${id}`),
+          text,
+          attachments: [],
+          dispatchMode: { type: "start_immediately" },
+          ...(from === "agent" ? { deliveryIntent: "auto" as const } : {}),
+        });
+        const { held, after } = yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const settled = (ordinal: number) =>
+            orchestrator.streamStoredEvents.pipe(
+              Stream.filter(
+                (event) =>
+                  event.event.type === "run.updated" &&
+                  event.event.payload.ordinal === ordinal &&
+                  (event.event.payload.status === "failed" ||
+                    event.event.payload.status === "completed"),
+              ),
+              Stream.runHead,
+            );
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            createdBy: "user",
+            creationSource: "web",
+            commandId: CommandId.make(`command:${key}:create`),
+            threadId: limitedThreadId,
+            projectId: ProjectId.make(`project:${key}`),
+            title: "Limited sends",
+            modelSelection: usedUp,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: cwd,
+          });
+          yield* orchestrator.dispatch(send("first", "Start the work.", "user"));
+          yield* Deferred.await(started);
+          // A background agent outlives the turn, which then runs into the account's limit.
+          if (release === "move") yield* Ref.set(backgroundWork, true);
+          yield* Deferred.succeed(releaseFirst, undefined);
+          yield* settled(1);
+          yield* worker.drain();
+          // Idle on the used-up account: a sub-session's report, the person's message, a notice.
+          const sends = [
+            send("report", "Sub-session finished: the tests pass.", "agent"),
+            send("person", "How is it going?", "user"),
+            send("notice", "Background task completed.", "agent"),
+          ];
+          for (const [index, command] of sends.entries()) {
+            yield* orchestrator.dispatch(command);
+            yield* worker.drain();
+            // Without the patch each one starts at once, and fails, before the next arrives.
+            if (!aiva) yield* settled(index + 2);
+          }
+          yield* worker.drain();
+          const held = yield* orchestrator.getThreadProjection(limitedThreadId);
+          if (!aiva) return { held, after: held };
+          if (release === "move") {
+            // The sidecar moves the thread (t3_thread_configure), ending the background agent.
+            yield* orchestrator.dispatch({
+              type: "thread.model-selection.set",
+              commandId: CommandId.make(`command:${key}:move`),
+              threadId: limitedThreadId,
+              modelSelection: roomy,
+              endBackgroundWork: true,
+            });
+          } else {
+            // The account has usage again: the sidecar carries the thread on where it is.
+            yield* orchestrator.dispatch({
+              type: "queue.resume",
+              commandId: CommandId.make(`command:${key}:resume`),
+              threadId: limitedThreadId,
+            });
+          }
+          yield* worker.drain();
+          const after = yield* waitForIdle(limitedThreadId).pipe(
+            Effect.timeoutOrElse({
+              duration: "20 seconds",
+              orElse: () => orchestrator.getThreadProjection(limitedThreadId),
+            }),
+          );
+          yield* worker.drain();
+          return { held, after };
+        }).pipe(
+          Effect.provide(
+            ProviderReplayHarness.layerWithRegistry(
+              {
+                name: key,
+                runtimePolicyOverride: {
+                  cwd,
+                  approvalPolicy: "never",
+                  sandboxPolicy: {
+                    type: "readOnly",
+                    access: { type: "fullAccess" },
+                    networkAccess: false,
+                  },
+                },
+              },
+              layerRegistry,
+            ),
+          ),
+        );
+        const byOrdinal = (projection: OrchestrationV2ThreadProjection) =>
+          projection.runs
+            .toSorted((left, right) => left.ordinal - right.ordinal)
+            .map((run) => [run.providerInstanceId, run.status, run.queueHeld === true]);
+        if (!aiva) {
+          // The failure loop: every send started on the used-up account and failed.
+          assert.deepEqual(byOrdinal(held), [
+            [usedUp.instanceId, "failed", false],
+            [usedUp.instanceId, "failed", false],
+            [usedUp.instanceId, "failed", false],
+            [usedUp.instanceId, "failed", false],
+          ]);
+          assert.lengthOf(yield* Ref.get(capturedTurns), 4);
+          return;
+        }
+        assert.deepEqual(byOrdinal(held), [
+          [usedUp.instanceId, "failed", false],
+          [usedUp.instanceId, "queued", false],
+          [usedUp.instanceId, "queued", false],
+          [usedUp.instanceId, "queued", false],
+        ]);
+        const to = release === "move" ? roomy.instanceId : usedUp.instanceId;
+        assert.deepEqual(byOrdinal(after), [
+          [usedUp.instanceId, "failed", false],
+          [to, "completed", false],
+          [to, "completed", false],
+          [to, "completed", false],
+        ]);
+        assert.deepEqual(
+          (yield* Ref.get(capturedTurns)).map((turn) => [
+            turn.modelSelection.instanceId,
+            turn.text,
+          ]),
+          [
+            [usedUp.instanceId, "Start the work."],
+            [to, "Sub-session finished: the tests pass."],
+            [to, "How is it going?"],
+            [to, "Background task completed."],
+          ],
+        );
+        if (release === "move") assert.lengthOf(yield* Ref.get(closedSessions), 1);
+      }),
+  );
+
+  // aiva P33 review: the hold lasts only while the limit does, and only for the account and model
+  // that hit it. A passed reset or another model starts the message; an unknown reset holds it.
+  it.live.each(["reset passed", "reset unknown", "another model"] as const)(
+    "holds a send to a limited thread only while that limit holds (%s)",
+    (variant) =>
+      Effect.gen(function* () {
+        yield* Effect.acquireRelease(
+          Effect.sync(() => useAivaSettings(true)),
+          (restore) => Effect.sync(restore),
+        );
+        const key = `limited-send-${variant.replaceAll(" ", "-")}`;
+        const cwd = yield* checkpointWorkspace(key);
+        const capturedTurns = yield* Ref.make<ReadonlyArray<CapturedTurn>>([]);
+        const usedUp: ModelSelection = {
+          ...CLAUDE_MODEL_SELECTION,
+          instanceId: ProviderInstanceId.make("claude-used-up"),
+        };
+        const otherModel: ModelSelection = { ...usedUp, model: `${usedUp.model}-other` };
+        const now = yield* DateTime.now;
+        const resetAt =
+          variant === "reset passed"
+            ? DateTime.formatIso(DateTime.subtract(now, { minutes: 1 }))
+            : variant === "another model"
+              ? DateTime.formatIso(DateTime.add(now, { days: 3 }))
+              : undefined;
+        const limitedThreadId = ThreadId.make(`thread:${key}`);
+        const projection = yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            createdBy: "user",
+            creationSource: "web",
+            commandId: CommandId.make(`command:${key}:create`),
+            threadId: limitedThreadId,
+            projectId: ProjectId.make(`project:${key}`),
+            title: "Limited send",
+            modelSelection: usedUp,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: cwd,
+          });
+          const send = (id: string, text: string): OrchestrationV2Command => ({
+            type: "message.dispatch",
+            createdBy: "agent",
+            creationSource: "mcp",
+            commandId: CommandId.make(`command:${key}:${id}`),
+            threadId: limitedThreadId,
+            messageId: MessageId.make(`message:${key}:${id}`),
+            text,
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+            deliveryIntent: "auto",
+          });
+          yield* orchestrator.dispatch(send("first", "Start the work."));
+          yield* orchestrator.streamStoredEvents.pipe(
+            Stream.filter(
+              (event) =>
+                event.event.type === "run.updated" &&
+                event.event.payload.ordinal === 1 &&
+                event.event.payload.status === "failed",
+            ),
+            Stream.runHead,
+          );
+          yield* worker.drain();
+          if (variant === "another model") {
+            // A model of the same account that still has room (Fable's week ran out, not Opus's).
+            yield* orchestrator.dispatch({
+              type: "thread.model-selection.set",
+              commandId: CommandId.make(`command:${key}:model`),
+              threadId: limitedThreadId,
+              modelSelection: otherModel,
+            });
+            yield* worker.drain();
+          }
+          yield* orchestrator.dispatch(send("next", "A sub-session finished."));
+          yield* worker.drain();
+          return variant === "reset unknown"
+            ? yield* orchestrator.getThreadProjection(limitedThreadId)
+            : yield* waitForIdle(limitedThreadId).pipe(
+                Effect.timeoutOrElse({
+                  duration: "20 seconds",
+                  orElse: () => orchestrator.getThreadProjection(limitedThreadId),
+                }),
+              );
+        }).pipe(
+          Effect.provide(
+            ProviderReplayHarness.layerWithRegistry(
+              {
+                name: key,
+                runtimePolicyOverride: {
+                  cwd,
+                  approvalPolicy: "never",
+                  sandboxPolicy: {
+                    type: "readOnly",
+                    access: { type: "fullAccess" },
+                    networkAccess: false,
+                  },
+                },
+              },
+              ProviderAdapterRegistry.layerFromAdapters([
+                makeTestAdapter({
+                  instanceId: usedUp.instanceId,
+                  driver: CLAUDE_DRIVER,
+                  capabilities: ClaudeProviderCapabilitiesV2,
+                  modelSelection: usedUp,
+                  responseByRunOrdinal: {},
+                  capturedTurns,
+                  failedRunOrdinals: new Set([1]),
+                  failure: makeProviderFailure({
+                    message: "Claude usage limit reached.",
+                    code: "rate_limit_error",
+                    class: "usage_limit",
+                    retryable: true,
+                    ...(resetAt === undefined ? {} : { resetAt }),
+                  }),
+                }),
+              ]),
+            ),
+          ),
+        );
+        assert.deepEqual(
+          projection.runs
+            .toSorted((left, right) => left.ordinal - right.ordinal)
+            .map((run) => [run.modelSelection.model, run.status]),
+          [
+            [usedUp.model, "failed"],
+            variant === "reset unknown"
+              ? [usedUp.model, "queued"]
+              : [variant === "another model" ? otherModel.model : usedUp.model, "completed"],
+          ],
+        );
+      }),
+  );
+
   // aiva P29/P31: "wake": a Claude wake pinned to a used-up account the thread left. "held": nothing
   // in Aiva resumes a held queue, so the move or startup must. "stopped": a Stop on a run still
   // starting keeps the hold through both. "unreadable"/"prepared": every read of a queued start fails

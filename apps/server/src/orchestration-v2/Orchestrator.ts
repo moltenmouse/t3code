@@ -204,6 +204,7 @@ import {
 import { planThreadDeletion } from "./ThreadDeletion.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ServerSettings from "../serverSettings.ts";
+import { aivaLimitedRunAhead, aivaResumeContinuesLimit } from "../aiva/limitedSends.ts";
 import { aivaInteractionMode } from "../aiva/noPlanMode.ts";
 import {
   aivaFailsMessagesAfterFailedSetup,
@@ -2384,6 +2385,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         readonly endedRunId?: RunId;
         readonly queuedRunId?: RunId;
         readonly userStarted?: boolean;
+        /** aiva P33: the sidecar's `queue.resume`; the account the queue waits on has usage. */
+        readonly continuesLimit?: boolean;
       },
     ) {
       if (!(yield* projectionStore.canStartQueuedRun(threadId))) return;
@@ -2465,6 +2468,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       };
       // A limited provider would fail and consume every waiting message.
       if (
+        options?.continuesLimit !== true &&
         usageLimitHoldsQueue(
           projection,
           queuedRun.providerInstanceId,
@@ -7637,7 +7641,17 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       projection.thread.worktreePath === null
         ? latestRun
         : undefined;
-    const queueBehindRun = activeRun ?? worktreeMissingRun;
+    // aiva P33: nor start on the account and model the thread's latest run ran out of usage on,
+    // while that limit holds; it waits until the thread moves, its queue resumes or the reset.
+    const usageLimitedRun =
+      activeRun === undefined &&
+      worktreeMissingRun === undefined &&
+      (dispatchMode.type === "queue_after_active" || dispatchMode.type === "start_immediately") &&
+      command.usageLimitContinuationOfRunId === undefined &&
+      !isNativeMaintenanceCommand(command)
+        ? aivaLimitedRunAhead(projection, modelSelection, yield* DateTime.now)
+        : undefined;
+    const queueBehindRun = activeRun ?? worktreeMissingRun ?? usageLimitedRun;
     const pendingMergeBackTransfers = pendingMergeBackTransfersForThread(projection);
     const startsOrQueuesRun =
       dispatchMode.type === "defer_start" ||
@@ -15388,7 +15402,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           }
         }
         const nextRun = selectedRun ?? queuedRunsInDeliveryOrder(projection)[0];
+        // aiva P33: Aiva's apps never resume a queue; its sidecar does, once the account has usage.
         if (
+          !(command.type === "queue.resume" && aivaResumeContinuesLimit()) &&
           usageLimitHoldsQueue(
             projection,
             nextRun === undefined
@@ -15784,6 +15800,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         startNextQueuedRun(command.threadId, {
           userStarted: command.type !== "thread.runtime-mode.set",
           ...(command.type === "queued-run.start" ? { queuedRunId: command.runId } : {}),
+          ...(command.type === "queue.resume" && aivaResumeContinuesLimit()
+            ? { continuesLimit: true }
+            : {}),
         }),
       );
     }
