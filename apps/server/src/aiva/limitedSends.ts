@@ -8,24 +8,32 @@ import type {
   OrchestrationV2Run,
   OrchestrationV2ThreadProjection,
 } from "@t3tools/contracts";
-import { usageLimitBlockedRun } from "@t3tools/shared/orchestrationV2ThreadError";
+import {
+  latestRootProviderFailure,
+  usageLimitBlockedRun,
+} from "@t3tools/shared/orchestrationV2ThreadError";
 import * as DateTime from "effect/DateTime";
 
 import { loadAivaSettings } from "./settings.ts";
 
 const aivaHoldsLimitedSends = (enabled: boolean = loadAivaSettings() !== null): boolean => enabled;
 
+/** How long a limit with no reset time holds sends: the Aiva sidecar looks again after as long. */
+const UNKNOWN_RESET_HOLD_MS = 30 * 60 * 1000;
+
 /**
  * The run a message for an idle thread waits behind: the thread's latest run, when it ran out of
- * usage on `instanceId`. Undefined: the message may start (another account, or nothing limited).
+ * usage on `selection`'s account and model and that limit is still in force (its reset, or half
+ * an hour when none is known). Another account or model, or a passed reset: the message starts.
  */
 export function aivaLimitedRunAhead(
   projection: Pick<OrchestrationV2ThreadProjection, "runs" | "turnItems" | "providerSessions">,
-  instanceId: ModelSelection["instanceId"],
+  selection: ModelSelection,
+  now: DateTime.Utc,
 ): OrchestrationV2Run | undefined {
   if (!aivaHoldsLimitedSends()) return undefined;
   const latestSession = projection.providerSessions
-    .filter((session) => session.providerInstanceId === instanceId)
+    .filter((session) => session.providerInstanceId === selection.instanceId)
     .reduce<OrchestrationV2ThreadProjection["providerSessions"][number] | undefined>(
       (latest, session) =>
         latest === undefined || DateTime.isGreaterThan(session.updatedAt, latest.updatedAt)
@@ -38,7 +46,19 @@ export function aivaLimitedRunAhead(
     projection.turnItems,
     latestSession?.lastError ?? null,
   );
-  return limited?.providerInstanceId === instanceId ? limited : undefined;
+  if (
+    limited?.providerInstanceId !== selection.instanceId ||
+    limited.modelSelection.model !== selection.model
+  )
+    return undefined;
+  const resetAt = latestRootProviderFailure(limited, projection.turnItems)?.resetAt;
+  const until =
+    resetAt != null
+      ? Date.parse(resetAt)
+      : limited.completedAt == null
+        ? Number.NaN
+        : DateTime.toEpochMillis(limited.completedAt) + UNKNOWN_RESET_HOLD_MS;
+  return Number.isFinite(until) && until > DateTime.toEpochMillis(now) ? limited : undefined;
 }
 
 /** `queue.resume` from Aiva's sidecar: the account has usage again, so the queue starts. */

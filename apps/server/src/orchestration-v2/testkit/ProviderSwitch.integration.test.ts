@@ -3220,6 +3220,142 @@ describe("orchestration v2 provider switching", () => {
       }),
   );
 
+  // aiva P33 review: the hold lasts only while the limit does, and only for the account and model
+  // that hit it. A passed reset or another model starts the message; an unknown reset holds it.
+  it.live.each(["reset passed", "reset unknown", "another model"] as const)(
+    "holds a send to a limited thread only while that limit holds (%s)",
+    (variant) =>
+      Effect.gen(function* () {
+        yield* Effect.acquireRelease(
+          Effect.sync(() => useAivaSettings(true)),
+          (restore) => Effect.sync(restore),
+        );
+        const key = `limited-send-${variant.replaceAll(" ", "-")}`;
+        const cwd = yield* checkpointWorkspace(key);
+        const capturedTurns = yield* Ref.make<ReadonlyArray<CapturedTurn>>([]);
+        const usedUp: ModelSelection = {
+          ...CLAUDE_MODEL_SELECTION,
+          instanceId: ProviderInstanceId.make("claude-used-up"),
+        };
+        const otherModel: ModelSelection = { ...usedUp, model: `${usedUp.model}-other` };
+        const now = yield* DateTime.now;
+        const resetAt =
+          variant === "reset passed"
+            ? DateTime.formatIso(DateTime.subtract(now, { minutes: 1 }))
+            : variant === "another model"
+              ? DateTime.formatIso(DateTime.add(now, { days: 3 }))
+              : undefined;
+        const limitedThreadId = ThreadId.make(`thread:${key}`);
+        const projection = yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            createdBy: "user",
+            creationSource: "web",
+            commandId: CommandId.make(`command:${key}:create`),
+            threadId: limitedThreadId,
+            projectId: ProjectId.make(`project:${key}`),
+            title: "Limited send",
+            modelSelection: usedUp,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: cwd,
+          });
+          const send = (id: string, text: string): OrchestrationV2Command => ({
+            type: "message.dispatch",
+            createdBy: "agent",
+            creationSource: "mcp",
+            commandId: CommandId.make(`command:${key}:${id}`),
+            threadId: limitedThreadId,
+            messageId: MessageId.make(`message:${key}:${id}`),
+            text,
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+            deliveryIntent: "auto",
+          });
+          yield* orchestrator.dispatch(send("first", "Start the work."));
+          yield* orchestrator.streamStoredEvents.pipe(
+            Stream.filter(
+              (event) =>
+                event.event.type === "run.updated" &&
+                event.event.payload.ordinal === 1 &&
+                event.event.payload.status === "failed",
+            ),
+            Stream.runHead,
+          );
+          yield* worker.drain();
+          if (variant === "another model") {
+            // A model of the same account that still has room (Fable's week ran out, not Opus's).
+            yield* orchestrator.dispatch({
+              type: "thread.model-selection.set",
+              commandId: CommandId.make(`command:${key}:model`),
+              threadId: limitedThreadId,
+              modelSelection: otherModel,
+            });
+            yield* worker.drain();
+          }
+          yield* orchestrator.dispatch(send("next", "A sub-session finished."));
+          yield* worker.drain();
+          return variant === "reset unknown"
+            ? yield* orchestrator.getThreadProjection(limitedThreadId)
+            : yield* waitForIdle(limitedThreadId).pipe(
+                Effect.timeoutOrElse({
+                  duration: "20 seconds",
+                  orElse: () => orchestrator.getThreadProjection(limitedThreadId),
+                }),
+              );
+        }).pipe(
+          Effect.provide(
+            ProviderReplayHarness.layerWithRegistry(
+              {
+                name: key,
+                runtimePolicyOverride: {
+                  cwd,
+                  approvalPolicy: "never",
+                  sandboxPolicy: {
+                    type: "readOnly",
+                    access: { type: "fullAccess" },
+                    networkAccess: false,
+                  },
+                },
+              },
+              ProviderAdapterRegistry.layerFromAdapters([
+                makeTestAdapter({
+                  instanceId: usedUp.instanceId,
+                  driver: CLAUDE_DRIVER,
+                  capabilities: ClaudeProviderCapabilitiesV2,
+                  modelSelection: usedUp,
+                  responseByRunOrdinal: {},
+                  capturedTurns,
+                  failedRunOrdinals: new Set([1]),
+                  failure: makeProviderFailure({
+                    message: "Claude usage limit reached.",
+                    code: "rate_limit_error",
+                    class: "usage_limit",
+                    retryable: true,
+                    ...(resetAt === undefined ? {} : { resetAt }),
+                  }),
+                }),
+              ]),
+            ),
+          ),
+        );
+        assert.deepEqual(
+          projection.runs
+            .toSorted((left, right) => left.ordinal - right.ordinal)
+            .map((run) => [run.modelSelection.model, run.status]),
+          [
+            [usedUp.model, "failed"],
+            variant === "reset unknown"
+              ? [usedUp.model, "queued"]
+              : [variant === "another model" ? otherModel.model : usedUp.model, "completed"],
+          ],
+        );
+      }),
+  );
+
   // aiva P29/P31: "wake": a Claude wake pinned to a used-up account the thread left. "held": nothing
   // in Aiva resumes a held queue, so the move or startup must. "stopped": a Stop on a run still
   // starting keeps the hold through both. "unreadable"/"prepared": every read of a queued start fails

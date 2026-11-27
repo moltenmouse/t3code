@@ -7641,15 +7641,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       projection.thread.worktreePath === null
         ? latestRun
         : undefined;
-    // aiva P33: nor start on an account the thread's latest run ran out of usage on; it waits with
-    // the runs queued there until the thread moves or its queue is resumed.
+    // aiva P33: nor start on the account and model the thread's latest run ran out of usage on,
+    // while that limit holds; it waits until the thread moves, its queue resumes or the reset.
     const usageLimitedRun =
       activeRun === undefined &&
       worktreeMissingRun === undefined &&
       (dispatchMode.type === "queue_after_active" || dispatchMode.type === "start_immediately") &&
       command.usageLimitContinuationOfRunId === undefined &&
       !isNativeMaintenanceCommand(command)
-        ? aivaLimitedRunAhead(projection, modelSelection.instanceId)
+        ? aivaLimitedRunAhead(projection, modelSelection, yield* DateTime.now)
         : undefined;
     const queueBehindRun = activeRun ?? worktreeMissingRun ?? usageLimitedRun;
     const pendingMergeBackTransfers = pendingMergeBackTransfersForThread(projection);
